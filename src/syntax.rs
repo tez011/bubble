@@ -1,0 +1,1497 @@
+use crate::io::InputPort;
+use std::cell::Cell;
+use std::rc::Rc;
+
+type Scope = usize;
+type ScopeSet = std::collections::BTreeSet<Scope>;
+type MatchEnv<'a> = std::collections::HashMap<&'a str, MatchValue>;
+type MatchSlice<'a, 'b> = std::collections::HashMap<&'a str, &'b MatchValue>;
+
+#[derive(Debug, Clone)]
+pub struct SyntaxObject {
+    e: Datum,
+    children: Vec<std::rc::Rc<SyntaxObject>>,
+    scopes: ScopeSet,
+    pub source_location: (usize, usize),
+}
+
+#[derive(Debug)]
+pub struct Environment {
+    macros: std::collections::HashMap<String, SyntaxRules>,
+    bindings: std::collections::HashMap<String, std::collections::BTreeMap<ScopeSet, usize>>,
+    scope_counter: Cell<usize>,
+    binding_counter: Cell<usize>,
+}
+
+#[derive(Debug)]
+pub enum Error {
+    NoToken,
+    UnexpectedToken,
+    IoError(std::io::Error),
+    InvalidNumber(&'static str),
+    InvalidCharacter,
+
+    BadSyntax(Rc<SyntaxObject>),
+    AmbiguousBinding(String),
+    NoMatchingPattern(Rc<SyntaxObject>),
+    UnrecognizedIdentifier(Rc<SyntaxObject>),
+}
+impl std::fmt::Display for Error {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Error::NoToken => write!(f, "No token found"),
+            Error::UnexpectedToken => write!(f, "Unexpected token"),
+            Error::IoError(e) => write!(f, "I/O error: {}", e),
+            Error::InvalidNumber(msg) => write!(f, "Invalid number: {}", msg),
+            Error::InvalidCharacter => write!(f, "Invalid character"),
+            Error::BadSyntax(stx) => write!(f, "Bad syntax: {}", stx),
+            Error::AmbiguousBinding(name) => write!(f, "Bad syntax due to ambiguous binding: {}", name),
+            Error::NoMatchingPattern(stx) => write!(f, "No macro expansion for pattern: {}", stx),
+            Error::UnrecognizedIdentifier(stx) => write!(f, "Unrecognized identifier: {}", stx),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Token {
+    Identifier(String),
+    Boolean(bool),
+    Number(String, TokenTag),
+    Character(String),
+    String(String),
+    Open,
+    Close,
+    Vector,
+    Bytes,
+    Quote,
+    Backquote,
+    Unquote,
+    UnquoteSplicing,
+    Dot,
+}
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TokenTag {
+    Integer,
+    Rational,
+    Decimal,
+    Infinity,
+    NaN,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+enum Datum {
+    Boolean(bool),
+    Integer(i64),
+    Rational(i64, i64),
+    Float(f64),
+    Character(char),
+    String(String),
+    Symbol(String),
+    Bytes(Vec<u8>),
+    List,
+    ImproperList,
+    Vector,
+}
+
+#[derive(Debug, Clone)]
+enum MatchValue {
+    One(Rc<SyntaxObject>),
+    Many(Vec<MatchValue>),
+}
+
+type SyntaxRules = Vec<(Pattern, Template)>;
+
+#[derive(Debug, Clone)]
+enum Pattern {
+    Underscore,
+    Literal(String),
+    Variable(String),
+    List(Vec<Pattern>),
+    ImproperList(Vec<Pattern>, Box<Pattern>),
+    Vector(Vec<Pattern>),
+    Ellipsis(Box<Pattern>),
+    Constant(Datum),
+}
+
+#[derive(Debug, Clone)]
+enum Template {
+    Constant(Datum),
+    Identifier(String),
+    Ellipsis(Box<Template>),
+    List(Vec<Template>),
+    ImproperList(Vec<Template>, Box<Template>),
+    Vector(Vec<Template>),
+}
+
+static CORE_FORMS: [&str; 8] = ["lambda", "if", "begin", "set!", "quote", "quasiquote", "unquote", "unquote-splicing"];
+static SYNTAX_DEFINITION_PATTERN: std::sync::LazyLock<Pattern> = std::sync::LazyLock::new(|| Pattern::List(vec![
+    Pattern::Literal("define-syntax".into()),
+    Pattern::Variable("name".into()),
+    Pattern::List(vec![
+        Pattern::Literal("syntax-rules".into()),
+        Pattern::Variable("literals".into()),
+        Pattern::Ellipsis(Box::new(Pattern::List(vec![
+            Pattern::Variable("pattern".into()),
+            Pattern::Variable("template".into()),
+        ]))),
+    ]),
+]));
+
+
+impl SyntaxObject {
+    fn simple(e: Datum, source_location: (usize, usize)) -> Self {
+        Self::compound(e, Vec::new(), source_location)
+    }
+    fn compound(e: Datum, children: Vec<SyntaxObject>, source_location: (usize, usize)) -> Self {
+        SyntaxObject {
+            e,
+            children: children.into_iter().map(std::rc::Rc::new).collect(),
+            scopes: Default::default(),
+            source_location
+        }
+    }
+
+    fn add_scope(&mut self, scope: Scope) {
+        match self.e {
+            Datum::Symbol(_) => {
+                self.scopes.insert(scope);
+            },
+            Datum::List | Datum::ImproperList | Datum::Vector => {
+                self.scopes.insert(scope);
+                for child in self.children.iter_mut() {
+                    std::rc::Rc::make_mut(child).add_scope(scope);
+                }
+            },
+            _ => (),
+        }
+    }
+}
+impl std::fmt::Display for SyntaxObject {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match &self.e {
+            Datum::Boolean(true) => write!(f, "#t"),
+            Datum::Boolean(false) => write!(f, "#f"),
+            Datum::Integer(i) => write!(f, "{}", i),
+            Datum::Rational(n, d) => write!(f, "{}/{}", n, d),
+            Datum::Float(fl) => write!(f, "{}", fl),
+            Datum::Character(c) => write!(f, "\\#{}", c),
+            Datum::String(s) => write!(f, "\"{}\"", s),
+            Datum::Bytes(b) => write!(f, "{:?}", b),
+            Datum::Symbol(s) => write!(f, "{}:{:?}", s, self.scopes),
+            Datum::List => {
+                write!(f, "(")?;
+                for (i, child) in self.children.iter().enumerate() {
+                    write!(f, "{}", child)?;
+                    if i < self.children.len() - 1 {
+                        write!(f, " ")?;
+                    }
+                }
+                write!(f, ")")
+            },
+            Datum::ImproperList => {
+                write!(f, "(")?;
+                for (i, child) in self.children.iter().enumerate() {
+                    write!(f, "{}", child)?;
+                    if i < self.children.len() - 2 {
+                        write!(f, " ")?;
+                    } else if i == self.children.len() - 1 {
+                        write!(f, " . ")?;
+                    }
+                }
+                write!(f, ")")
+            },
+            Datum::Vector => {
+                write!(f, "#(")?;
+                for (i, child) in self.children.iter().enumerate() {
+                    write!(f, "{}", child)?;
+                    if i < self.children.len() - 1 {
+                        write!(f, " ")?;
+                    }
+                }
+                write!(f, ")")
+            },
+        }
+    }
+}
+
+impl<'a> Pattern {
+    pub fn try_match(&'a self, input: Rc<SyntaxObject>) -> Option<MatchEnv<'a>> {
+        match self {
+            Pattern::Underscore => Some(Default::default()),
+            Pattern::Literal(s) => {
+                if let Datum::Symbol(sym) = &input.e {
+                    if sym == s {
+                        return Some(Default::default());
+                    }
+                }
+                None
+            }
+            Pattern::Variable(v) => Some([(v.as_str(), MatchValue::One(input))].into_iter().collect()),
+            Pattern::List(patterns) if matches!(input.e, Datum::List) => Self::try_match_sequence(patterns, &input.children, None),
+            Pattern::ImproperList(patterns, tailcdr) if patterns.len() > 1 => {
+                if matches!(input.e, Datum::List) {
+                    return Self::try_match_sequence(patterns, &input.children, Some(tailcdr));
+                } else if matches!(input.e, Datum::ImproperList) {
+                    if let Some(mut env) = Self::try_match_sequence(patterns, &input.children[..input.children.len()-1], None) {
+                        if let Some(tenv) = tailcdr.try_match(input.children.last().unwrap().clone()) {
+                            env.extend(tenv);
+                            return Some(env);
+                        }
+                    }
+                }
+                None
+            }
+            Pattern::Vector(patterns) if matches!(input.e, Datum::Vector) => Self::try_match_sequence(patterns, &input.children, None),
+            Pattern::Ellipsis(_) => None, // not allowed here
+            Pattern::Constant(Datum::List | Datum::ImproperList | Datum::Vector) => unreachable!(),
+            Pattern::Constant(datum) if datum == &input.e => Some(Default::default()),
+            _ => None,
+        }
+    }
+
+    fn try_match_sequence(patterns: &'a [Pattern], inputs: &[Rc<SyntaxObject>], tailcdr: Option<&'a Pattern>) -> Option<MatchEnv<'a>> {
+        let mut pit = patterns.iter();
+        let mut si = 0;
+        let mut env = MatchEnv::new();
+        while let (Some(pattern), Some(mut input)) = (pit.next(), inputs.get(si)) {
+            match pattern {
+                Pattern::Ellipsis(inner) => {
+                    while let Some(e) = inner.try_match(input.clone()) {
+                        for (k, v) in e {
+                            match env.get_mut(k) {
+                                Some(MatchValue::Many(vs)) => vs.push(v),
+                                Some(MatchValue::One(_)) => panic!(),
+                                None => { env.insert(k, MatchValue::Many(vec![v])); },
+                            }
+                        }
+
+                        si += 1;
+                        if let Some(n) = inputs.get(si) {
+                            input = n;
+                        } else {
+                            break;
+                        }
+                    }
+                },
+                pattern => match pattern.try_match(input.clone()) {
+                    Some(e) => {
+                        env.extend(e);
+                        si += 1;
+                    },
+                    None => return None,
+                }
+            }
+        }
+
+        if si < inputs.len() {
+            // There are remaining inputs that need to be matched against the tail pattern. They form a list.
+            match tailcdr {
+                None => None,
+                Some(Pattern::Underscore) => Some(env),
+                Some(Pattern::Literal(_)) | Some(Pattern::Constant(_)) => None,
+                Some(Pattern::Variable(v)) => {
+                    env.insert(v, MatchValue::Many(inputs[si..].iter().map(|s| MatchValue::One(s.clone())).collect()));
+                    Some(env)
+                },
+                Some(Pattern::List(sp)) | Some(Pattern::Vector(sp)) => {
+                    env.extend(Self::try_match_sequence(sp, &inputs[si..], None)?);
+                    Some(env)
+                },
+                Some(Pattern::ImproperList(sp, tailcdr)) => {
+                    env.extend(Self::try_match_sequence(sp, &inputs[si..], Some(tailcdr))?);
+                    Some(env)
+                },
+                Some(Pattern::Ellipsis(_)) => None, // not allowed here
+            }
+        } else {
+            Some(env)
+        }
+    }
+
+    fn from_sequence(children: &[Rc<SyntaxObject>], literals: &std::collections::HashSet<&str>) -> Result<Vec<Self>, ()> {
+        let mut patterns = Vec::new();
+        let mut it = children.iter().peekable();
+        while let Some(child) = it.next() {
+            if let Ok(subpat) = Pattern::from(child, literals) {
+                if let Some(lookahead) = it.peek() {
+                    if let Datum::Symbol(lookahead) = &lookahead.e {
+                        if lookahead == "..." {
+                            it.next();
+                            patterns.push(Pattern::Ellipsis(Box::new(subpat)));
+                        } else {
+                            patterns.push(subpat);
+                        }
+                    } else {
+                        patterns.push(subpat);
+                    }
+                } else {
+                    patterns.push(subpat);
+                }
+            } else {
+                return Err(());
+            }
+        }
+
+        Ok(patterns)
+    }
+
+    fn from(stx: &Rc<SyntaxObject>, literals: &std::collections::HashSet<&str>) -> Result<Self, ()> {
+        match &stx.e {
+            Datum::Symbol(s) if s == "_" => Ok(Pattern::Underscore),
+            Datum::Symbol(s) if literals.contains(s.as_str()) => Ok(Pattern::Literal(s.clone())),
+            Datum::Symbol(s) => Ok(Pattern::Variable(s.clone())),
+            Datum::String(_) | Datum::Character(_) | Datum::Boolean(_) | Datum::Bytes(_) => Ok(Pattern::Constant(stx.e.clone())),
+            Datum::Rational(_, _) | Datum::Integer(_) | Datum::Float(_) => Ok(Pattern::Constant(stx.e.clone())),
+            Datum::List => Ok(Pattern::List(Self::from_sequence(&stx.children, literals)?)),
+            Datum::Vector => Ok(Pattern::Vector(Self::from_sequence(&stx.children, literals)?)),
+            Datum::ImproperList => Ok(Pattern::ImproperList(
+                Self::from_sequence(&stx.children[..stx.children.len()-1], literals)?,
+                Box::new(Self::from(stx.children.last().unwrap(), literals)?),
+            )),
+        }
+    }
+}
+
+impl Template {
+    fn from_sequence(sequence: &[Rc<SyntaxObject>], literal_ellipsis: bool) -> Result<Vec<Self>, ()> {
+        let mut si = 0;
+        let mut res = Vec::new();
+        while si < sequence.len() {
+            let ellipsis_following = match sequence.get(si + 1).map(|s| &s.e) {
+                Some(Datum::Symbol(s)) if s == "..." && !literal_ellipsis => true,
+                _ => false,
+            };
+            if ellipsis_following {
+                res.push(Template::Ellipsis(Box::new(Template::from(&sequence[si])?)));
+                si += 2;
+            } else {
+                res.push(Template::from(&sequence[si])?);
+                si += 1;
+            }
+        }
+        Ok(res)
+    }
+
+    fn from_template(stx: &Rc<SyntaxObject>, literal_ellipsis: bool) -> Result<Self, ()> {
+        match &stx.e {
+            Datum::Symbol(s) => Ok(Template::Identifier(s.clone())),
+            Datum::List => {
+                match stx.children.first().map(|e| &e.e) {
+                    Some(Datum::Symbol(head)) if head == "..." => {
+                        if let Some(stx) = stx.children.get(1) {
+                            Self::from_template(stx, true)
+                        } else {
+                            Err(())
+                        }
+                    },
+                    _ => Ok(Template::List(Self::from_sequence(&stx.children, literal_ellipsis)?)),
+                }
+            },
+            Datum::ImproperList => Ok(Template::ImproperList(
+                Self::from_sequence(&stx.children[..stx.children.len()-1], literal_ellipsis)?,
+                Box::new(Self::from(stx.children.last().unwrap())?),
+            )),
+            Datum::Vector => Ok(Template::Vector(Self::from_sequence(&stx.children, literal_ellipsis)?)),
+            _ => Ok(Template::Constant(stx.e.clone())),
+        }
+    }
+
+    fn from(stx: &Rc<SyntaxObject>) -> Result<Self, ()> {
+        Self::from_template(stx, false)
+    }
+
+    fn count_ellipsis_repetition(&self, env: &MatchSlice) -> Result<usize, ()> {
+        let mut reps = None;
+        let mut queue = std::collections::VecDeque::new();
+        queue.push_back(self);
+        loop {
+            match queue.pop_front() {
+                None => return Ok(reps.unwrap_or(0)),
+                Some(Template::Constant(_)) => (),
+                Some(Template::Identifier(s)) => match env.get(s.as_str()) {
+                    Some(MatchValue::Many(vs)) => match reps {
+                        None => reps = Some(vs.len()),
+                        Some(r) if r == vs.len() => (),
+                        _ => return Err(()),
+                    },
+                    Some(MatchValue::One(_)) => unreachable!(),
+                    None => (),
+                },
+                Some(Template::Ellipsis(inner)) => queue.push_back(inner),
+                Some(Template::List(templates)) | Some(Template::Vector(templates)) => queue.extend(templates),
+                Some(Template::ImproperList(templates, template)) => {
+                    queue.extend(templates);
+                    queue.push_back(template);
+                },
+            }
+        }
+    }
+    fn apply_sequence(templates: &[Template], env: &MatchSlice, stx: &Rc<SyntaxObject>, expand_scope: usize) -> Result<Vec<Rc<SyntaxObject>>, Error> {
+        let mut result = Vec::new();
+        for t in templates {
+            match t {
+                Template::Ellipsis(inner) => {
+                    let n = inner.count_ellipsis_repetition(env).map_err(|_| Error::BadSyntax(stx.clone()))?;
+                    for i in 0..n {
+                        let env_slice = env.iter()
+                            .map(|(k, v)| (*k, match v {
+                                MatchValue::One(_) => v,
+                                MatchValue::Many(vs) => vs.get(i).unwrap(),
+                            }))
+                            .collect::<MatchSlice>();
+                        result.push(Rc::new(inner.apply(&env_slice, stx, expand_scope)?));
+                    }
+                },
+                _ => result.push(Rc::new(t.apply(env, stx, expand_scope)?)),
+            }
+        }
+
+        Ok(result)
+    }
+    fn apply(&self, env: &MatchSlice, stx: &Rc<SyntaxObject>, expand_scope: usize) -> Result<SyntaxObject, Error> {
+        match self {
+            Template::Constant(datum) => Ok(SyntaxObject {
+                e: datum.clone(),
+                children: vec![],
+                scopes: Default::default(),
+                source_location: stx.source_location,
+            }),
+            Template::Identifier(s) => match env.get(s.as_str()) {
+                Some(MatchValue::One(stx)) => Ok(SyntaxObject {
+                    e: stx.e.clone(),
+                    children: stx.children.iter().map(Rc::clone).collect(),
+                    scopes: stx.scopes.clone(),
+                    source_location: stx.source_location,
+                }),
+                None => Ok(SyntaxObject {
+                    e: Datum::Symbol(s.clone()),
+                    children: vec![],
+                    scopes: stx.scopes.iter().map(|sc| *sc).chain(std::iter::once(expand_scope)).collect(),
+                    source_location: stx.source_location,
+                }),
+                _ => Err(Error::BadSyntax(stx.clone())),
+            }
+            Template::Ellipsis(_) => unreachable!(),
+            Template::List(templates) => Ok(SyntaxObject {
+                e: Datum::List,
+                children: Self::apply_sequence(templates, env, stx, expand_scope)?,
+                scopes: Default::default(),
+                source_location: stx.source_location,
+            }),
+            Template::ImproperList(templates, template) => Ok(SyntaxObject {
+                e: Datum::ImproperList,
+                children: Self::apply_sequence(templates, env, stx, expand_scope)?.into_iter()
+                    .chain(std::iter::once(Rc::new(template.apply(env, stx, expand_scope)?)))
+                    .collect(),
+                scopes: Default::default(),
+                source_location: stx.source_location,
+            }),
+            Template::Vector(templates) => Ok(SyntaxObject {
+                e: Datum::Vector,
+                children: Self::apply_sequence(templates, env, stx, expand_scope)?,
+                scopes: Default::default(),
+                source_location: stx.source_location,
+            }),
+        }
+    }
+}
+
+impl Environment {
+    pub fn new() -> Self {
+        Self {
+            macros: std::collections::HashMap::new(),
+            bindings: CORE_FORMS.iter().enumerate()
+                .map(|(i, name)| (name.to_string(), std::iter::once((ScopeSet::new(), i)).collect()))
+                .collect(),
+            scope_counter: Cell::new(1),
+            binding_counter: Cell::new(CORE_FORMS.len()),
+        }
+    }
+
+    fn new_scope(&self) -> usize {
+        let scope = self.scope_counter.get();
+        self.scope_counter.set(scope + 1);
+        scope
+    }
+    fn new_binding(&self) -> usize {
+        let binding = self.binding_counter.get();
+        self.binding_counter.set(binding + 1);
+        binding
+    }
+    fn resolve(&self, stx: &Rc<SyntaxObject>) -> Result<Option<usize>, Error> {
+        let (name, mut candidates) = match &stx.e {
+            Datum::Symbol(name) => match self.bindings.get(name) {
+                Some(bindings) => (name, bindings.iter().filter(|(c_scopes, _)| c_scopes.is_subset(&stx.scopes))),
+                None => return Ok(None),
+            },
+            _ => return Ok(None),
+        };
+
+        let (best_scopes, best_binding) = match candidates.clone().max_by_key(|(c_scopes, _)| c_scopes.len()) {
+            Some(s) => s,
+            None => return Ok(None),
+        };
+        if candidates.all(|(c_scopes, _)| c_scopes.is_subset(best_scopes)) {
+            Ok(Some(*best_binding))
+        } else {
+            Err(Error::AmbiguousBinding(name.clone()))
+        }
+    }
+
+    pub fn define_syntax(&mut self, s: SyntaxObject) -> Result<SyntaxObject, Error> {
+        let s = Rc::new(s);
+        if let Some(matches) = SYNTAX_DEFINITION_PATTERN.try_match(s.clone()) {
+            let name = match matches.get("name") {
+                Some(MatchValue::One(stx)) => {
+                    if let Datum::Symbol(name) = &stx.e {
+                        name.clone()
+                    } else {
+                        return Err(Error::BadSyntax(stx.clone()));
+                    }
+                },
+                _ => return Err(Error::BadSyntax(s)),
+            };
+            let literals = match matches.get("literals") {
+                Some(MatchValue::One(stx)) => {
+                    stx.children.iter().map(|c| {
+                        if let Datum::Symbol(s) = &c.e {
+                            Ok(s.as_str())
+                        } else {
+                            Err(Error::BadSyntax(stx.clone()))
+                        }
+                    }).collect::<Result<std::collections::HashSet<_>, _>>()?
+                },
+                _ => return Err(Error::BadSyntax(s)),
+            };
+            let patterns = match matches.get("pattern") {
+                Some(MatchValue::Many(vs)) => vs.iter().map(|v| match v {
+                    MatchValue::One(stx) => Pattern::from(stx, &literals).map_err(|_| Error::BadSyntax(stx.clone())),
+                    _ => Err(Error::BadSyntax(s.clone())),
+                }).collect::<Result<Vec<_>, _>>()?,
+                _ => return Err(Error::BadSyntax(s)),
+            };
+            let templates = match matches.get("template") {
+                Some(MatchValue::Many(vs)) => vs.iter().map(|v| match v {
+                    MatchValue::One(stx) => Template::from(stx).map_err(|_| Error::BadSyntax(stx.clone())),
+                    _ => Err(Error::BadSyntax(s.clone())),
+                }).collect::<Result<Vec<_>, _>>()?,
+                _ => return Err(Error::BadSyntax(s)),
+            };
+            if patterns.len() == templates.len() {
+                self.macros.insert(name, std::iter::zip(patterns, templates).collect());
+                Ok(SyntaxObject {
+                    e: Datum::Boolean(true),
+                    children: vec![],
+                    scopes: Default::default(),
+                    source_location: s.source_location
+                })
+            } else {
+                Err(Error::BadSyntax(s))
+            }
+        } else {
+            Ok(Rc::into_inner(s).unwrap())
+        }
+    }
+
+    fn expand_syntax_once(&self, stx: Rc<SyntaxObject>) -> Result<(Rc<SyntaxObject>, bool), Error> {
+        match &stx.e {
+            Datum::List | Datum::ImproperList | Datum::Vector if stx.children.len() > 0 => {
+                if let Datum::Symbol(name) = &stx.children.first().unwrap().e {
+                    if let Some(rules) = self.macros.get(name) {
+                        for (pattern, template) in rules {
+                            if let Some(pure_env) = pattern.try_match(stx.clone()) {
+                                let match_env = pure_env.iter()
+                                    .map(|(k, v)| (*k, v))
+                                    .collect();
+                                return template.apply(&match_env, &stx, self.new_scope())
+                                    .map(|stx| (Rc::new(stx), true));
+                            }
+                        }
+                        return Err(Error::NoMatchingPattern(stx));
+                    }
+                }
+
+                let mut children = Vec::new();
+                let mut modified = false;
+                for c in &stx.children {
+                    let (c, modif) = self.expand_syntax_once(c.clone())?;
+                    children.push(c);
+                    modified |= modif;
+                }
+                Ok((Rc::new(SyntaxObject {
+                    e: stx.e.clone(),
+                    children,
+                    scopes: stx.scopes.clone(),
+                    source_location: stx.source_location,
+                }), modified))
+            },
+            _ => Ok((stx, false)),
+        }
+    }
+    fn add_binding_scopes(&mut self, stx: &mut SyntaxObject) -> Result<(), Error> {
+        if stx.e == Datum::List || stx.e == Datum::ImproperList {
+            if self.resolve(stx.children.first().unwrap())?.is_some_and(|b| b == 0) {
+                let bind_scope = self.new_scope();
+                stx.children.iter_mut()
+                    .skip(1)
+                    .for_each(|c| Rc::make_mut(c).add_scope(bind_scope));
+                match stx.children.get(1).map(|c| &c.e) {
+                    None => return Err(Error::BadSyntax(stx.children[0].clone())),
+                    Some(Datum::Symbol(name)) => {
+                        let b = self.new_binding();
+                        self.bindings.entry(name.clone()).or_default()
+                            .insert(stx.children[1].scopes.clone(), b);
+                    },
+                    Some(Datum::List) | Some(Datum::ImproperList) => {
+                        stx.children.get(1).unwrap()
+                            .children.iter()
+                            .filter_map(|c| match &c.e {
+                                Datum::Symbol(name) => Some((name, &c.scopes)),
+                                _ => None,
+                            }).for_each(|(name, scopes)| {
+                                let b = self.new_binding();
+                                self.bindings.entry(name.to_string()).or_default()
+                                    .insert(scopes.clone(), b);
+                            });
+                    },
+                    Some(_) => return Err(Error::BadSyntax(stx.children[1].clone())),
+                }
+            }
+            stx.children.iter_mut()
+                .map(|c| self.add_binding_scopes(Rc::make_mut(c)))
+                .collect::<Result<(), _>>()?;
+        }
+        Ok(())
+    }
+    fn resolve_syntax(&self, stx: &Rc<SyntaxObject>) -> Result<crate::Expression, Error> {
+        match &**stx {
+            SyntaxObject { e: Datum::Boolean(b), .. } => Ok(crate::Expression::Boolean(*b)),
+            SyntaxObject { e: Datum::Integer(i), .. } => Ok(crate::Expression::Integer(*i)),
+            SyntaxObject { e: Datum::Rational(n, d), .. } => Ok(crate::Expression::Rational(*n, *d)),
+            SyntaxObject { e: Datum::Float(f), .. } => Ok(crate::Expression::Float(*f)),
+            SyntaxObject { e: Datum::Character(c), .. } => Ok(crate::Expression::Character(*c)),
+            SyntaxObject { e: Datum::String(s), .. } => Ok(crate::Expression::String(s.clone())),
+            SyntaxObject { e: Datum::Bytes(b), .. } => Ok(crate::Expression::Bytes(b.clone())),
+            SyntaxObject { e: Datum::Symbol(name), .. } => {
+                let binding = self.resolve(stx)?.ok_or_else(|| Error::UnrecognizedIdentifier(stx.clone()))?;
+                Ok(crate::Expression::Symbol(format!("{}{}", name, binding)))
+            },
+            SyntaxObject { e: Datum::List, children, .. } => Ok(crate::Expression::List(children.iter().map(|c| self.resolve_syntax(c)).collect::<Result<Vec<_>, _>>()?)),
+            SyntaxObject { e: Datum::Vector, children, .. } => Ok(crate::Expression::Vector(children.iter().map(|c| self.resolve_syntax(c)).collect::<Result<Vec<_>, _>>()?)),
+            SyntaxObject { e: Datum::ImproperList, children, .. } => {
+                let mut children = children.iter().map(|c| self.resolve_syntax(c)).collect::<Result<Vec<_>, _>>()?;
+                let tail = Box::new(children.pop().unwrap());
+                Ok(crate::Expression::ImproperList(children, tail))
+            },
+        }
+    }
+    pub fn expand_syntax(&mut self, s: SyntaxObject) -> Result<crate::Expression, Error> {
+        let mut stx = Rc::new(s);
+        let mut expanded = loop {
+            match self.expand_syntax_once(stx)? {
+                (ns, true) => stx = ns,
+                (ns, false) => break ns,
+            }
+        };
+
+        self.add_binding_scopes(Rc::make_mut(&mut expanded))?;
+        self.resolve_syntax(&expanded)
+    }
+}
+
+/******** parser ********/
+
+pub fn read(port: &mut InputPort) -> Result<SyntaxObject, Error> {
+    read_datum(port, None)
+}
+
+fn read_datum(port: &mut InputPort, token: Option<(Token, (usize, usize))>) -> Result<SyntaxObject, Error> {
+    let (token, source_location) = match token {
+        Some((t, l)) => (t, l),
+        None => match next_token(port).map_err(Error::IoError)? {
+            Some((t, l)) => (t, l),
+            None => return Err(Error::NoToken),
+        }
+    };
+    match token {
+        Token::Boolean(b) => Ok(SyntaxObject::simple(Datum::Boolean(b), source_location)),
+        Token::Number(s, st) => Ok(SyntaxObject::simple(parse_number(s, st)?, source_location)),
+        Token::Character(s) => {
+            let c = parse_character(s).map_err(|_| Error::InvalidCharacter)?;
+            Ok(SyntaxObject::simple(Datum::Character(c), source_location))
+        },
+        Token::String(s) => {
+            let s = parse_string(s).map_err(|_| Error::InvalidCharacter)?;
+            Ok(SyntaxObject::simple(Datum::String(s), source_location))
+        },
+        Token::Identifier(s) => {
+            let s = parse_identifier(s).map_err(|_| Error::InvalidCharacter)?;
+            Ok(SyntaxObject::simple(Datum::Symbol(s), source_location))
+        },
+        Token::Open => {
+            let mut children = Vec::new();
+            loop {
+                match next_token(port).map_err(Error::IoError)? {
+                    Some((Token::Close, _)) => return Ok(SyntaxObject::compound(Datum::List, children, source_location)),
+                    Some((Token::Dot, _)) => {
+                        children.push(read_datum(port, None)?);
+                        match next_token(port).map_err(Error::IoError)? {
+                            Some((Token::Close, _)) => return Ok(SyntaxObject::compound(Datum::ImproperList, children, source_location)),
+                            _ => return Err(Error::UnexpectedToken),
+                        }
+                    },
+                    t => children.push(read_datum(port, t)?),
+                }
+            }
+        },
+        Token::Vector => {
+            let mut children = Vec::new();
+            loop {
+                match next_token(port).map_err(Error::IoError)? {
+                    Some((Token::Close, _)) => return Ok(SyntaxObject::compound(Datum::Vector, children, source_location)),
+                    t => children.push(read_datum(port, t)?),
+                }
+            }
+        },
+        Token::Bytes => {
+            let mut bytes = Vec::new();
+            loop {
+                match next_token(port).map_err(Error::IoError)? {
+                    Some((Token::Close, _)) => return Ok(SyntaxObject::simple(Datum::Bytes(bytes), source_location)),
+                    Some((Token::Number(s, TokenTag::Integer), _)) => {
+                        match s.parse::<u8>() {
+                            Ok(b) => bytes.push(b),
+                            Err(_) => return Err(Error::InvalidNumber("expected byte")),
+                        }
+                    },
+                    _ => return Err(Error::UnexpectedToken),
+                }
+            }
+        },
+        Token::Quote => Ok(SyntaxObject::compound(Datum::List,
+            vec![SyntaxObject::simple(Datum::Symbol("quote".to_string()), source_location), read_datum(port, None)?],
+            source_location)),
+        Token::Backquote => Ok(SyntaxObject::compound(Datum::List,
+            vec![SyntaxObject::simple(Datum::Symbol("quasiquote".to_string()), source_location), read_datum(port, None)?],
+            source_location)),
+        Token::Unquote => Ok(SyntaxObject::compound(Datum::List,
+            vec![SyntaxObject::simple(Datum::Symbol("unquote".to_string()), source_location), read_datum(port, None)?],
+            source_location)),
+        Token::UnquoteSplicing => Ok(SyntaxObject::compound(Datum::List,
+            vec![SyntaxObject::simple(Datum::Symbol("unquote-splicing".to_string()), source_location), read_datum(port, None)?],
+            source_location)),
+        _ => Err(Error::UnexpectedToken),
+    }
+}
+fn parse_boolean(s: &str) -> Result<bool, ()> {
+    match s {
+        "#t" | "#true" => Ok(true),
+        "#f" | "#false" => Ok(false),
+        _ => Err(()),
+    }
+}
+fn parse_number(fs: String, st: TokenTag) -> Result<Datum, Error> {
+    let mut s = fs.as_str();
+    let mut radix = 10;
+    let mut sign = 1;
+    if s.starts_with("#b") {
+        radix = 2;
+        s = &s[2..];
+    } else if s.starts_with("#o") {
+        radix = 8;
+        s = &s[2..];
+    } else if s.starts_with("#x") {
+        radix = 16;
+        s = &s[2..];
+    } else if s.starts_with("#d") {
+        radix = 10;
+        s = &s[2..];
+    }
+
+    if s.starts_with('+') {
+        sign = 1;
+        s = &s[1..];
+    } else if s.starts_with('-') {
+        sign = -1;
+        s = &s[1..];
+    }
+
+    match st {
+        TokenTag::Integer => {
+            match i64::from_str_radix(s, radix) {
+                Ok(n) => Ok(Datum::Integer(sign * n)),
+                Err(e) => match e.kind() {
+                    std::num::IntErrorKind::Zero => Ok(Datum::Integer(0)),
+                    std::num::IntErrorKind::PosOverflow | std::num::IntErrorKind::NegOverflow => {
+                        match s.parse::<f64>() {
+                            Ok(f) => Ok(Datum::Float(sign as f64 * f)),
+                            Err(_) => Err(Error::InvalidNumber("illegal number")),
+                        }
+                    },
+                    _ => Err(Error::InvalidNumber("illegal number")),
+                }
+            }
+        }
+        TokenTag::Rational => {
+            let mut parts = s.splitn(2, '/');
+            if let (Some(nstr), Some(dstr)) = (parts.next(), parts.next()) {
+                match (i64::from_str_radix(nstr.trim(), radix), i64::from_str_radix(dstr.trim(), radix)) {
+                    (Ok(n), Ok(d)) => {
+                        if d == 0 {
+                            Err(Error::InvalidNumber("division by zero"))
+                        } else {
+                            Ok(Datum::Rational(sign * n, d))
+                        }
+                    },
+                    _ => Err(Error::InvalidNumber("illegal number")),
+                }
+            } else {
+                Err(Error::InvalidNumber("illegal number"))
+            }
+        }
+        TokenTag::Decimal => match s.parse::<f64>() {
+            Ok(f) => Ok(Datum::Float(sign as f64 * f)),
+            Err(_) => Err(Error::InvalidNumber("illegal number")),
+        },
+        TokenTag::Infinity => Ok(Datum::Float(sign as f64 * f64::INFINITY)),
+        TokenTag::NaN => Ok(Datum::Float(sign as f64 * f64::NAN)),
+    }
+}
+fn parse_character(s: String) -> Result<char, ()> {
+    match s.as_str() {
+        "#\\alarm" => Ok('\u{0007}'),
+        "#\\backspace" => Ok('\u{0008}'),
+        "#\\delete" => Ok('\u{007F}'),
+        "#\\escape" => Ok('\u{001B}'),
+        "#\\newline" => Ok('\n'),
+        "#\\return" => Ok('\r'),
+        "#\\space" => Ok(' '),
+        "#\\tab" => Ok('\t'),
+        _ => {
+            let mut cit = s.chars().skip(2);
+            match cit.next().unwrap() {
+                'x' => {
+                    u32::from_str_radix(&s[3..], 16)
+                        .ok()
+                        .and_then(char::from_u32)
+                        .ok_or(())
+                },
+                c => Ok(c),
+            }
+        }
+    }
+}
+fn parse_string(rstr: String) -> Result<String, ()> {
+    let mut ci = rstr.chars().skip(1).peekable();
+    let mut s = String::with_capacity(rstr.len() - 2);
+    while let Some(c) = ci.next() {
+        match c {
+            '"' => return Ok(s),
+            '\\' => {
+                match ci.next().ok_or(())? {
+                    'a' => s.push('\u{0007}'),
+                    'b' => s.push('\u{0008}'),
+                    'n' => s.push('\n'),
+                    'r' => s.push('\r'),
+                    't' => s.push('\t'),
+                    '"' => s.push('"'),
+                    '\\' => s.push('\\'),
+                    'x' => {
+                        let mut ccode = 0;
+                        while let Some(digit) = ci.next_if(|c| c.is_digit(16)) {
+                            ccode = ccode * 16 + digit.to_digit(16).unwrap();
+                        }
+                        if ci.next().unwrap() == ';' {
+                            s.push(unsafe { char::from_u32_unchecked(ccode)});
+                        }
+                    },
+                    ' ' | '\t' | '\n' | '\r' => {
+                        while let Some(c) = ci.next() {
+                            if c != ' ' && c != '\t' {
+                                break;
+                            }
+                        }
+                        match ci.next().ok_or(())? {
+                            '\n' => s.push('\n'),
+                            '\r' => {
+                                s.push('\r');
+                                if ci.peek().is_some_and(|&c| c == '\n') {
+                                    s.push('\n');
+                                    ci.next();
+                                }
+                            },
+                            _ => return Err(()),
+                        }
+                        while let Some(c) = ci.next() {
+                            if c != ' ' && c != '\t' {
+                                break;
+                            }
+                        }
+                    },
+                    _ => return Err(()),
+                };
+            },
+            _ => s.push(c),
+        }
+    }
+    Err(())
+}
+fn parse_identifier(rstr: String) -> Result<String, ()> {
+    if rstr.starts_with('|') {
+        let mut ci = rstr.chars().skip(1).peekable();
+        let mut s = String::new();
+        while let Some(c) = ci.next() {
+            match c {
+                '|' => return Ok(s),
+                '\\' => {
+                    match ci.next().ok_or(())? {
+                        'a' => s.push('\u{0007}'),
+                        'b' => s.push('\u{0008}'),
+                        'n' => s.push('\n'),
+                        'r' => s.push('\r'),
+                        't' => s.push('\t'),
+                        '|' => s.push('|'),
+                        '\\' => s.push('\\'),
+                        'x' => {
+                            let mut ccode = 0;
+                            while let Some(digit) = ci.next_if(|c| c.is_digit(16)) {
+                                ccode = ccode * 16 + digit.to_digit(16).unwrap();
+                            }
+                            if ci.next().unwrap() == ';' {
+                                s.push(unsafe { char::from_u32_unchecked(ccode)});
+                            }
+                        },
+                        _ => return Err(()),
+                    };
+                },
+                _ => s.push(c),
+            }
+        }
+        Err(())
+    } else {
+        Ok(rstr)
+    }
+}
+
+fn next_token(port: &mut InputPort) -> Result<Option<(Token, (usize, usize))>, std::io::Error> {
+    while let Some(dh) = atmosphere(port, 0)? {
+        port.advance(dh);
+    }
+
+    let source_location = port.location();
+    if let Some(r) = boolean(port, 0)? {
+        if r > 0 {
+            return Ok(Some((Token::Boolean(parse_boolean(port.advance(r)).unwrap()), source_location)));
+        }
+    }
+    if let Some((r, st)) = number(port, 0)? {
+        if r > 0 {
+            return Ok(Some((Token::Number(port.advance(r).to_string(), st), source_location)));
+        }
+    }
+    if let Some(r) = character(port, 0)? {
+        if r > 0 {
+            return Ok(Some((Token::Character(port.advance(r).to_string()), source_location)));
+        }
+    }
+    if let Some(r) = string(port, 0)? {
+        if r > 0 {
+            return Ok(Some((Token::String(port.advance(r).to_string()), source_location)));
+        }
+    }
+    if let Some(r) = identifier(port, 0)? {
+        if r > 0 {
+            return Ok(Some((Token::Identifier(port.advance(r).to_string()), source_location)));
+        }
+    }
+    if port.test("(", 0)? {
+        port.advance(1);
+        return Ok(Some((Token::Open, source_location)));
+    }
+    if port.test(")", 0)? {
+        port.advance(1);
+        return Ok(Some((Token::Close, source_location)));
+    }
+    if port.test("#(", 0)? {
+        port.advance(2);
+        return Ok(Some((Token::Vector, source_location)));
+    }
+    if port.test("#u8(", 0)? {
+        port.advance(4);
+        return Ok(Some((Token::Bytes, source_location)));
+    }
+    if port.test("'", 0)? {
+        port.advance(1);
+        return Ok(Some((Token::Quote, source_location)));
+    }
+    if port.test("`", 0)? {
+        port.advance(1);
+        return Ok(Some((Token::Backquote, source_location)));
+    }
+    if port.test(",@", 0)? {
+        port.advance(2);
+        return Ok(Some((Token::UnquoteSplicing, source_location)));
+    }
+    if port.test(",", 0)? {
+        port.advance(1);
+        return Ok(Some((Token::Unquote, source_location)));
+    }
+    if port.test(".", 0)? {
+        if let Some(_) = delimiter(port, 1)? {
+            port.advance(1);
+            return Ok(Some((Token::Dot, source_location)));
+        }
+    }
+
+    Ok(None)
+}
+fn delimiter(port: &mut InputPort, offset: usize) -> Result<Option<usize>, std::io::Error> {
+    if let Some(r) = whitespace(port, offset)? {
+        Ok(Some(r))
+    } else {
+        match port.peek(offset)? {
+            Some(b'(') | Some(b')') | Some(b'"') | Some(b';') | Some(b'|') => Ok(Some(1)),
+            _ => Ok(None),
+        }
+    }
+}
+fn intraline_whitespace(port: &mut InputPort, offset: usize) -> Result<Option<usize>, std::io::Error> {
+    if port.test(" ", offset)? || port.test("\t", offset)? {
+        Ok(Some(1))
+    } else {
+        Ok(None)
+    }
+}
+fn whitespace(port: &mut InputPort, offset: usize) -> Result<Option<usize>, std::io::Error> {
+    if let Some(r) = intraline_whitespace(port, offset)? {
+        Ok(Some(r))
+    } else if let Some(r) = line_ending(port, offset)? {
+        Ok(Some(r))
+    } else {
+        Ok(None)
+    }
+}
+fn line_ending(port: &mut InputPort, offset: usize) -> Result<Option<usize>, std::io::Error> {
+    if port.test("\n", offset)? {
+        Ok(Some(1))
+    } else if port.test("\r\n", offset)? {
+        Ok(Some(2))
+    } else if port.test("\r", offset)? {
+        Ok(Some(1))
+    } else {
+        Ok(None)
+    }
+}
+fn comment(port: &mut InputPort, offset: usize) -> Result<Option<usize>, std::io::Error> {
+    if let Some(r) = nested_comment(port, offset)? {
+        Ok(Some(r))
+    } else if port.peek(offset)? == Some(b';') {
+        let mut r = 1;
+        while line_ending(port, offset + r)?.is_none() {
+            r += 1;
+        }
+        Ok(Some(r))
+    } else {
+        Ok(None)
+    }
+}
+fn nested_comment(port: &mut InputPort, offset: usize) -> Result<Option<usize>, std::io::Error> {
+    if port.test("#|", offset)? {
+        let mut r = 2 + comment_text(port, offset + 2)?.unwrap_or(0);
+        while let Some(dr) = comment_cont(port, offset + r)? {
+            r += dr;
+            if dr == 0 {
+                break;
+            }
+        }
+        if port.test("|#", offset + r)? {
+            return Ok(Some(r + 2));
+        }
+    }
+    Ok(None)
+}
+fn comment_text(port: &mut InputPort, offset: usize) -> Result<Option<usize>, std::io::Error> {
+    let mut r = 0;
+    while !port.test("#|", offset + r)? && !port.test("|#", offset + r)? {
+        r += 1;
+    }
+    Ok(Some(r))
+}
+fn comment_cont(port: &mut InputPort, offset: usize) -> Result<Option<usize>, std::io::Error> {
+    if let Some(r) = nested_comment(port, offset)? {
+        Ok(Some(r + comment_text(port, offset + r)?.unwrap_or(0)))
+    } else {
+        Ok(None)
+    }
+}
+fn atmosphere(port: &mut InputPort, offset: usize) -> Result<Option<usize>, std::io::Error> {
+    if let Some(r) = comment(port, offset)? {
+        Ok(Some(r))
+    } else if let Some(r) = whitespace(port, offset)? {
+        Ok(Some(r))
+    } else {
+        Ok(None)
+    }
+}
+fn identifier(port: &mut InputPort, offset: usize) -> Result<Option<usize>, std::io::Error> {
+    if let Some(mut r) = initial(port, offset)? {
+        while let Some(dr) = subsequent(port, offset + r)? {
+            r += dr;
+        }
+        if let Some(_) = delimiter(port, offset + r)? {
+            return Ok(Some(r));
+        }
+    }
+    if let Some(r) = peculiar_identifier(port, offset)? {
+        return Ok(Some(r));
+    }
+    if port.test("|", offset)? {
+        let mut r = 1;
+        while let Some(dr) = symbol_element(port, offset + r)? {
+            r += dr;
+        }
+        if port.test("|", offset + r)? {
+            return Ok(Some(r + 1));
+        }
+    }
+    Ok(None)
+}
+fn initial(port: &mut InputPort, offset: usize) -> Result<Option<usize>, std::io::Error> {
+    match port.peek(offset)? {
+        Some(b'a'..=b'z') | Some(b'A'..=b'Z') => Ok(Some(1)),
+        Some(b'!') | Some(b'$') | Some(b'%') | Some(b'&') => Ok(Some(1)),
+        Some(b'*') | Some(b'/') | Some(b':') | Some(b'<') => Ok(Some(1)),
+        Some(b'=') | Some(b'>') | Some(b'?') | Some(b'^') => Ok(Some(1)),
+        Some(b'_') | Some(b'~') => Ok(Some(1)),
+        _ => Ok(None),
+    }
+}
+fn subsequent(port: &mut InputPort, offset: usize) -> Result<Option<usize>, std::io::Error> {
+    if let Some(r) = initial(port, offset)? {
+        return Ok(Some(r));
+    }
+    if let Some(r) = digit(port, offset, 10)? {
+        return Ok(Some(r));
+    }
+    match port.peek(offset)? {
+        Some(b'+') | Some(b'-') | Some(b'.') | Some(b'@') => Ok(Some(1)),
+        _ => Ok(None),
+    }
+}
+fn digit(port: &mut InputPort, offset: usize, base: i32) -> Result<Option<usize>, std::io::Error> {
+    match port.peek(offset)? {
+        Some(b'0'..=b'1') if base >= 2 => Ok(Some(1)),
+        Some(b'0'..=b'7') if base >= 8 => Ok(Some(1)),
+        Some(b'0'..=b'9') if base >= 10 => Ok(Some(1)),
+        Some(b'a'..=b'f') if base >= 16 => Ok(Some(1)),
+        Some(b'A'..=b'F') if base >= 16 => Ok(Some(1)),
+        _ => Ok(None),
+    }
+}
+fn sign(port: &mut InputPort, offset: usize) -> Result<Option<usize>, std::io::Error> {
+    match port.peek(offset)? {
+        Some(b'+') | Some(b'-') => Ok(Some(1)),
+        _ => Ok(Some(0)),
+    }
+}
+fn inline_hex_escape(port: &mut InputPort, offset: usize) -> Result<Option<usize>, std::io::Error> {
+    if port.test("\\x", offset)? {
+        let mut r = 2;
+        while let Some(dr) = digit(port, offset + r, 16)? {
+            r += dr;
+        }
+        if port.test(";", offset + r)? {
+            return Ok(Some(r + 1));
+        }
+    }
+    Ok(None)
+}
+fn mnemonic_escape(port: &mut InputPort, offset: usize) -> Result<Option<usize>, std::io::Error> {
+    match port.peek(offset)? {
+        Some(b'\\') => match port.peek(offset + 1)? {
+            Some(b'a') => Ok(Some(1)),
+            Some(b'b') => Ok(Some(1)),
+            Some(b'n') => Ok(Some(1)),
+            Some(b'r') => Ok(Some(1)),
+            Some(b't') => Ok(Some(1)),
+            _ => Ok(None),
+        },
+        _ => Ok(None),
+    }
+}
+fn peculiar_identifier(port: &mut InputPort, offset: usize) -> Result<Option<usize>, std::io::Error> {
+    let r = sign(port, offset)?.unwrap();
+    if port.peek(offset + r)? == Some(b'.') {
+        if let Some(mut s) = dot_subsequent(port, offset + r + 1)? {
+            while let Some(ds) = subsequent(port, offset + r + 1 + s)? {
+                s += ds;
+            }
+            return Ok(Some(r + 1 + s));
+        }
+    }
+    if r > 0 {
+        if let Some(mut s) = sign_subsequent(port, offset + r)? {
+            while let Some(ds) = subsequent(port, offset + r + s)? {
+                s += ds;
+            }
+            return Ok(Some(r + s));
+        } else {
+            return Ok(Some(r));
+        }
+    }
+    Ok(None)
+}
+fn dot_subsequent(port: &mut InputPort, offset: usize) -> Result<Option<usize>, std::io::Error> {
+    if let Some(r) = sign_subsequent(port, offset)? {
+        Ok(Some(r))
+    } else if port.peek(offset)? == Some(b'.') {
+        Ok(Some(1))
+    } else {
+        Ok(None)
+    }
+}
+fn sign_subsequent(port: &mut InputPort, offset: usize) -> Result<Option<usize>, std::io::Error> {
+    if let Some(r) = initial(port, offset)? {
+        return Ok(Some(r));
+    }
+    match port.peek(offset)? {
+        Some(b'+') | Some(b'-') | Some(b'@') => Ok(Some(1)),
+        _ => Ok(None),
+    }
+}
+fn symbol_element(port: &mut InputPort, offset: usize) -> Result<Option<usize>, std::io::Error> {
+    if let Some(r) = inline_hex_escape(port, offset)? {
+        Ok(Some(r))
+    } else if let Some(r) = mnemonic_escape(port, offset)? {
+        Ok(Some(r))
+    } else {
+        match port.peek_char(offset)? {
+            Some('|') => Ok(None),
+            Some('\\') => {
+                match port.peek(offset + 1)? {
+                    Some(b'|') => Ok(Some(2)),
+                    _ => Ok(None),
+                }
+            },
+            Some(c) => Ok(Some(c.len_utf8())),
+            None => Ok(None),
+        }
+    }
+}
+fn boolean(port: &mut InputPort, offset: usize) -> Result<Option<usize>, std::io::Error> {
+    match if port.test("#true", offset)? {
+        Some(5)
+    } else if port.test("#false", offset)? {
+        Some(6)
+    } else if port.test("#t", offset)? || port.test("#f", offset)? {
+        Some(2)
+    } else {
+        None
+    }
+    {
+        Some(r) => {
+            if let Some(_) = delimiter(port, offset + r)? {
+                Ok(Some(r))
+            } else {
+                Ok(None)
+            }
+        },
+        None => Ok(None),
+    }
+}
+fn character(port: &mut InputPort, offset: usize) -> Result<Option<usize>, std::io::Error> {
+    if port.test("#\\", offset)? {
+        let r = if port.test("alarm", offset + 2)? {
+            Some(7)
+        } else if port.test("backspace", offset + 2)? {
+            Some(11)
+        } else if port.test("delete", offset + 2)? {
+            Some(8)
+        } else if port.test("escape", offset + 2)? {
+            Some(8)
+        } else if port.test("newline", offset + 2)? {
+            Some(9)
+        } else if port.test("return", offset + 2)? {
+            Some(8)
+        } else if port.test("space", offset + 2)? {
+            Some(7)
+        } else if port.test("tab", offset + 2)? {
+            Some(7)
+        } else if port.test("x", offset + 2)? {
+            let mut r = 3;
+            while let Some(dr) = digit(port, offset + r, 16)? {
+                r += dr;
+            }
+            Some(r)
+        } else {
+            port.peek_char(offset + 2)?.map(|c| 2 + c.len_utf8())
+        };
+
+        if r.is_some_and(|r| r > 0) {
+            if delimiter(port, offset + r.unwrap())?.is_some() {
+                return Ok(r);
+            }
+        }
+    }
+    Ok(None)
+}
+fn string(port: &mut InputPort, offset: usize) -> Result<Option<usize>, std::io::Error> {
+    if port.peek(offset)? == Some(b'"'){
+        let mut r = 1;
+        while let Some(dr) = string_element(port, offset + r)? {
+            r += dr;
+        }
+        if port.peek(offset + r)? == Some(b'"') {
+            return Ok(Some(r + 1));
+        }
+    }
+    Ok(None)
+}
+fn string_element(port: &mut InputPort, offset: usize) -> Result<Option<usize>, std::io::Error> {
+    if let Some(r) = inline_hex_escape(port, offset)? {
+        return Ok(Some(r));
+    }
+    if let Some(r) = mnemonic_escape(port, offset)? {
+        return Ok(Some(r));
+    }
+    if let Some(c) = port.peek_char(offset)? {
+        if c == '\\' {
+            let nc = port.peek(offset + 1)?;
+            if nc == Some(b'"') || nc == Some(b'\\') {
+                return Ok(Some(2));
+            }
+
+            let mut r = 1;
+            while let Some(dr) = intraline_whitespace(port, offset + r)? {
+                r += dr;
+            }
+            if let Some(dr) = line_ending(port, offset + r)? {
+                r += dr;
+                while let Some(dr) = intraline_whitespace(port, offset + r)? {
+                    r += dr;
+                }
+                return Ok(Some(r));
+            }
+        } else if c != '"' {
+            return Ok(Some(c.len_utf8()));
+        }
+    }
+    Ok(None)
+}
+fn number(port: &mut InputPort, offset: usize) -> Result<Option<(usize, TokenTag)>, std::io::Error> {
+    for base in [2, 8, 10, 16] {
+        if let Some(r) = radix(port, offset, base)? {
+            if let Some((s, st)) = real(port, offset + r, base)? {
+                if let Some(_) = delimiter(port, offset + r + s)? {
+                    return Ok(Some((r + s, st)));
+                }
+            }
+        }
+    }
+    Ok(None)
+}
+fn real(port: &mut InputPort, offset: usize, base: i32) -> Result<Option<(usize, TokenTag)>, std::io::Error> {
+    if let Some((r, st)) = infnan(port, offset)? {
+        return Ok(Some((r, st)));
+    }
+    if let Some(r) = sign(port, offset)? {
+        if let Some((s, st)) = ureal(port, offset + r, base)? {
+            return Ok(Some((r + s, st)));
+        }
+    }
+    Ok(None)
+}
+fn ureal(port: &mut InputPort, offset: usize, base: i32) -> Result<Option<(usize, TokenTag)>, std::io::Error> {
+    if let Some(r) = decimal(port, offset)? {
+        if base == 10 {
+            return Ok(Some((r, TokenTag::Decimal)));
+        }
+    }
+    if let Some(r) = uinteger(port, offset, base)? {
+        if port.peek(offset + r)? == Some(b'/') {
+            if let Some(s) = uinteger(port, offset + r + 1, base)? {
+                return Ok(Some((r + s + 1, TokenTag::Rational)));
+            }
+        } else {
+            return Ok(Some((r, TokenTag::Integer)));
+        }
+    }
+    Ok(None)
+}
+fn decimal(port: &mut InputPort, offset: usize) -> Result<Option<usize>, std::io::Error> {
+    if let Some(mut r) = uinteger(port, offset, 10)? {
+        if port.peek(offset + r)? == Some(b'.') {
+            r += 1;
+            while let Some(dr) = digit(port, offset + r, 10)? {
+                r += dr;
+            }
+            if let Some(s) = suffix(port, offset + r)? {
+                return Ok(Some(r + s));
+            }
+        } else if let Some(s) = suffix(port, offset + r)? {
+            if s > 0 {
+                return Ok(Some(r + s));
+            }
+        }
+    } else if port.peek(offset)? == Some(b'.') {
+        let mut r = 1;
+        while let Some(dr) = digit(port, offset + r, 10)? {
+            r += dr;
+        }
+        if r > 1 {
+            if let Some(s) = suffix(port, offset + r)? {
+                return Ok(Some(r + s));
+            }
+        }
+    }
+    Ok(None)
+}
+fn uinteger(port: &mut InputPort, offset: usize, base: i32) -> Result<Option<usize>, std::io::Error> {
+    if let Some(mut r) = digit(port, offset, base)? {
+        while let Some(dr) = digit(port, offset + r, base)? {
+            r += dr;
+        }
+        Ok(Some(r))
+    } else {
+        Ok(None)
+    }
+}
+fn infnan(port: &mut InputPort, offset: usize) -> Result<Option<(usize, TokenTag)>, std::io::Error> {
+    if port.test("+inf.0", offset)? || port.test("-inf.0", offset)? {
+        Ok(Some((6, TokenTag::Infinity)))
+    } else if port.test("+nan.0", offset)? || port.test("-nan.0", offset)? {
+        Ok(Some((6, TokenTag::NaN)))
+    } else {
+        Ok(None)
+    }
+}
+fn suffix(port: &mut InputPort, offset: usize) -> Result<Option<usize>, std::io::Error> {
+    match port.peek(offset)? {
+        Some(b'e') | Some(b'E') => {
+            if let Some(r) = sign(port, offset + 1)? {
+                if let Some(s) = uinteger(port, offset + r + 1, 10)? {
+                    return Ok(Some(r + s + 1));
+                }
+            }
+            Ok(None)
+        },
+        _ => Ok(Some(0)),
+    }
+}
+fn radix(port: &mut InputPort, offset: usize, base: i32) -> Result<Option<usize>, std::io::Error> {
+    if base == 2 && port.test("#b", offset)? {
+        Ok(Some(2))
+    } else if base == 8 && port.test("#b", offset)? {
+        Ok(Some(2))
+    } else if base == 10 {
+        if port.test("#d", offset)? {
+            Ok(Some(2))
+        } else {
+            Ok(Some(0))
+        }
+    } else if base == 16 && port.test("#x", offset)? {
+        Ok(Some(2))
+    } else {
+        Ok(None)
+    }
+}
