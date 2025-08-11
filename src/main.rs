@@ -1,15 +1,56 @@
 mod io;
 mod syntax;
 
+#[derive(Debug, Clone, Copy)]
+pub enum Binding {
+    CoreForm(CoreForm),
+    ExpandOnlyCoreForm,
+    CorePrimitive,
+    SyntaxTransformer(usize),
+    Variable(usize),
+}
+
+#[repr(u8)] #[derive(Debug, Clone, Copy)]
+pub enum CoreForm {
+    Lambda,
+    If,
+    Begin,
+    SetBang,
+    Quote,
+    Quasiquote,
+    Unquote,
+    UnquoteSplicing,
+    DefineValues,
+    _MaxValue,
+}
+impl std::fmt::Display for CoreForm {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            CoreForm::Lambda => write!(f, "lambda"),
+            CoreForm::If => write!(f, "if"),
+            CoreForm::Begin => write!(f, "begin"),
+            CoreForm::SetBang => write!(f, "set!"),
+            CoreForm::Quote => write!(f, "quote"),
+            CoreForm::Quasiquote => write!(f, "quasiquote"),
+            CoreForm::Unquote => write!(f, "unquote"),
+            CoreForm::UnquoteSplicing => write!(f, "unquote-splicing"),
+            CoreForm::DefineValues => write!(f, "define-values"),
+            CoreForm::_MaxValue => panic!(),
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub enum Expression {
+    CoreForm(CoreForm),
+    CorePrimitive(String),
+    Variable(usize),
     Boolean(bool),
     Integer(i64),
     Rational(i64, i64),
     Float(f64),
     Character(char),
     String(String),
-    Symbol(String),
     Bytes(Vec<u8>),
     List(Vec<Expression>),
     ImproperList(Vec<Expression>, Box<Expression>),
@@ -18,6 +59,9 @@ pub enum Expression {
 impl std::fmt::Display for Expression {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            Expression::CoreForm(cf) => cf.fmt(f),
+            Expression::CorePrimitive(s) => s.fmt(f),
+            Expression::Variable(x) => write!(f, "x{}", x),
             Expression::Boolean(true) => write!(f, "#t"),
             Expression::Boolean(false) => write!(f, "#f"),
             Expression::Integer(i) => write!(f, "{}", i),
@@ -26,7 +70,6 @@ impl std::fmt::Display for Expression {
             Expression::Character(c) => write!(f, "\\#{}", c),
             Expression::String(s) => write!(f, "\"{}\"", s),
             Expression::Bytes(b) => write!(f, "{:?}", b),
-            Expression::Symbol(s) => write!(f, "{}", s),
             Expression::List(children) => {
                 write!(f, "(")?;
                 for (i, child) in children.iter().enumerate() {
@@ -64,36 +107,19 @@ impl std::fmt::Display for Expression {
 fn main() {
     let mut stdin = std::io::stdin().lock();
     let mut handle = io::InputPort::try_from(&mut stdin as &mut dyn std::io::Read).unwrap();
-    let mut eenv = syntax::Environment::new();
+    let mut e_env = syntax::Environment::new();
     loop {
-        let ns = syntax::read(&mut handle);
-        if ns.is_err() {
-            let location = handle.location();
-            eprintln!("Parse error: {}:{}: {}", location.0, location.1, ns.unwrap_err());
-            break;
-        }
-
-        let ns = ns.unwrap();
-        let ns = match eenv.define_syntax(ns) {
-            Ok(ns) => {
-                println!("raw: {}:{}: {}", ns.source_location.0, ns.source_location.1, ns);
-                ns
-            },
+        let stx = match syntax::read(&mut handle) {
+            Ok(stx) => stx,
+            Err(e) => { eprintln!("Parse error at {:?}: {}", handle.location(), e); continue; },
+        };
+        let se = match syntax::expand(stx, &mut e_env) {
+            Ok(se) => se,
             Err(e) => {
-                println!("error: {}", e);
+                eprintln!("Expand error at {:?}: {}", handle.location(), e);
                 continue;
             }
         };
-
-        match eenv.expand_syntax(ns) {
-            Ok(e) => {
-                println!("resolved: {}", e);
-                e
-            },
-            Err(e) => {
-                println!("error: {}", e);
-                continue;
-            }
-        };
+        println!("final form: {:?}", se);
     }
 }

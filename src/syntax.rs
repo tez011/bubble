@@ -1,5 +1,6 @@
+use crate::Binding;
 use crate::io::InputPort;
-use std::cell::Cell;
+use std::cell::{Cell, LazyCell};
 use std::rc::Rc;
 
 type Scope = usize;
@@ -10,17 +11,17 @@ type MatchSlice<'a, 'b> = std::collections::HashMap<&'a str, &'b MatchValue>;
 #[derive(Debug, Clone)]
 pub struct SyntaxObject {
     e: Datum,
-    children: Vec<std::rc::Rc<SyntaxObject>>,
+    children: Vec<Rc<SyntaxObject>>,
     scopes: ScopeSet,
-    pub source_location: (usize, usize),
+    source_location: (usize, usize),
 }
 
 #[derive(Debug)]
 pub struct Environment {
-    macros: std::collections::HashMap<String, SyntaxRules>,
-    bindings: std::collections::HashMap<String, std::collections::BTreeMap<ScopeSet, usize>>,
+    macros: std::collections::VecDeque<SyntaxRules>,
+    bindings: std::collections::HashMap<String, std::collections::BTreeMap<ScopeSet, crate::Binding>>,
     scope_counter: Cell<usize>,
-    binding_counter: Cell<usize>,
+    bound_id_counter: Cell<usize>,
 }
 
 #[derive(Debug)]
@@ -34,7 +35,6 @@ pub enum Error {
     BadSyntax(Rc<SyntaxObject>),
     AmbiguousBinding(String),
     NoMatchingPattern(Rc<SyntaxObject>),
-    UnrecognizedIdentifier(Rc<SyntaxObject>),
 }
 impl std::fmt::Display for Error {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -47,7 +47,6 @@ impl std::fmt::Display for Error {
             Error::BadSyntax(stx) => write!(f, "Bad syntax: {}", stx),
             Error::AmbiguousBinding(name) => write!(f, "Bad syntax due to ambiguous binding: {}", name),
             Error::NoMatchingPattern(stx) => write!(f, "No macro expansion for pattern: {}", stx),
-            Error::UnrecognizedIdentifier(stx) => write!(f, "Unrecognized identifier: {}", stx),
         }
     }
 }
@@ -91,6 +90,10 @@ enum Datum {
     List,
     ImproperList,
     Vector,
+    Quote,
+    Quasiquote,
+    Unquote,
+    UnquoteSplicing,
 }
 
 #[derive(Debug, Clone)]
@@ -115,7 +118,7 @@ enum Pattern {
 
 #[derive(Debug, Clone)]
 enum Template {
-    Constant(Datum),
+    Constant(Rc<SyntaxObject>),
     Identifier(String),
     Ellipsis(Box<Template>),
     List(Vec<Template>),
@@ -123,7 +126,6 @@ enum Template {
     Vector(Vec<Template>),
 }
 
-static CORE_FORMS: [&str; 8] = ["lambda", "if", "begin", "set!", "quote", "quasiquote", "unquote", "unquote-splicing"];
 static SYNTAX_DEFINITION_PATTERN: std::sync::LazyLock<Pattern> = std::sync::LazyLock::new(|| Pattern::List(vec![
     Pattern::Literal("define-syntax".into()),
     Pattern::Variable("name".into()),
@@ -136,7 +138,37 @@ static SYNTAX_DEFINITION_PATTERN: std::sync::LazyLock<Pattern> = std::sync::Lazy
         ]))),
     ]),
 ]));
+static PRIMITIVE_DEFINITION_PATTERN: std::sync::LazyLock<Pattern> = std::sync::LazyLock::new(|| Pattern::List(vec![
+    Pattern::Literal("define-core-primitives".into()),
+    Pattern::List(vec![
+        Pattern::Ellipsis(Box::new(Pattern::Variable("name".into()))),
+    ]),
+]));
+static VALUE_DEFINITION_PATTERN: std::sync::LazyLock<Pattern> = std::sync::LazyLock::new(|| Pattern::List(vec![
+    Pattern::Literal("define-values".into()),
+    Pattern::List(vec![Pattern::Ellipsis(Box::new(Pattern::Variable("formals".into())))]),
+    Pattern::Variable("expression".into()),
+]));
+static SYNTAX_BINDING_PATTERN: std::sync::LazyLock<Pattern> = std::sync::LazyLock::new(|| Pattern::ImproperList(vec![
+    Pattern::Literal("letrec-syntax".into()),
+    Pattern::List(vec![
+        Pattern::Ellipsis(Box::new(Pattern::List(vec![
+            Pattern::Variable("name".into()),
+            Pattern::List(vec![
+                Pattern::Literal("syntax-rules".into()),
+                Pattern::Variable("literals".into()),
+                Pattern::Ellipsis(Box::new(Pattern::List(vec![
+                    Pattern::Variable("pattern".into()),
+                    Pattern::Variable("template".into()),
+                ]))),
+            ]),
+        ]))),
+    ]),
+], Box::new(Pattern::Variable("body".into()))));
 
+thread_local! {
+    static CORE_FORM_BEGIN_STX: LazyCell<Rc<SyntaxObject>> = const { LazyCell::new(|| Rc::new(SyntaxObject { e: Datum::Symbol("begin".into()), children: vec![], scopes: Default::default(), source_location: (0, 0)})) };
+}
 
 impl SyntaxObject {
     fn simple(e: Datum, source_location: (usize, usize)) -> Self {
@@ -145,7 +177,7 @@ impl SyntaxObject {
     fn compound(e: Datum, children: Vec<SyntaxObject>, source_location: (usize, usize)) -> Self {
         SyntaxObject {
             e,
-            children: children.into_iter().map(std::rc::Rc::new).collect(),
+            children: children.into_iter().map(Rc::new).collect(),
             scopes: Default::default(),
             source_location
         }
@@ -153,14 +185,14 @@ impl SyntaxObject {
 
     fn add_scope(&mut self, scope: Scope) {
         match self.e {
-            Datum::Symbol(_) => {
+            Datum::Symbol(_) | Datum::Quote => {
                 self.scopes.insert(scope);
             },
-            Datum::List | Datum::ImproperList | Datum::Vector => {
+            Datum::List | Datum::ImproperList | Datum::Vector | Datum::Quasiquote | Datum::Unquote | Datum::UnquoteSplicing => {
                 self.scopes.insert(scope);
-                for child in self.children.iter_mut() {
-                    std::rc::Rc::make_mut(child).add_scope(scope);
-                }
+                self.children.iter_mut()
+                    .filter(|stx| matches!(stx.e, Datum::Symbol(_) | Datum::List | Datum::ImproperList | Datum::Vector | Datum::Quasiquote | Datum::Unquote | Datum::UnquoteSplicing))
+                    .for_each(|stx| Rc::make_mut(stx).add_scope(scope));
             },
             _ => (),
         }
@@ -178,6 +210,10 @@ impl std::fmt::Display for SyntaxObject {
             Datum::String(s) => write!(f, "\"{}\"", s),
             Datum::Bytes(b) => write!(f, "{:?}", b),
             Datum::Symbol(s) => write!(f, "{}:{:?}", s, self.scopes),
+            Datum::Quote => write!(f, "'{}", self.children[0]),
+            Datum::Quasiquote => write!(f, "`{}", self.children[0]),
+            Datum::Unquote => write!(f, ",{}", self.children[0]),
+            Datum::UnquoteSplicing => write!(f, ",@{}", self.children[0]),
             Datum::List => {
                 write!(f, "(")?;
                 for (i, child) in self.children.iter().enumerate() {
@@ -215,7 +251,7 @@ impl std::fmt::Display for SyntaxObject {
 }
 
 impl<'a> Pattern {
-    pub fn try_match(&'a self, input: Rc<SyntaxObject>) -> Option<MatchEnv<'a>> {
+    pub fn try_match(&'a self, input: &Rc<SyntaxObject>) -> Option<MatchEnv<'a>> {
         match self {
             Pattern::Underscore => Some(Default::default()),
             Pattern::Literal(s) => {
@@ -226,14 +262,14 @@ impl<'a> Pattern {
                 }
                 None
             }
-            Pattern::Variable(v) => Some([(v.as_str(), MatchValue::One(input))].into_iter().collect()),
+            Pattern::Variable(v) => Some([(v.as_str(), MatchValue::One(input.clone()))].into_iter().collect()),
             Pattern::List(patterns) if matches!(input.e, Datum::List) => Self::try_match_sequence(patterns, &input.children, None),
-            Pattern::ImproperList(patterns, tailcdr) if patterns.len() > 1 => {
+            Pattern::ImproperList(patterns, tailcdr) => {
                 if matches!(input.e, Datum::List) {
                     return Self::try_match_sequence(patterns, &input.children, Some(tailcdr));
                 } else if matches!(input.e, Datum::ImproperList) {
                     if let Some(mut env) = Self::try_match_sequence(patterns, &input.children[..input.children.len()-1], None) {
-                        if let Some(tenv) = tailcdr.try_match(input.children.last().unwrap().clone()) {
+                        if let Some(tenv) = tailcdr.try_match(input.children.last().unwrap()) {
                             env.extend(tenv);
                             return Some(env);
                         }
@@ -253,10 +289,10 @@ impl<'a> Pattern {
         let mut pit = patterns.iter();
         let mut si = 0;
         let mut env = MatchEnv::new();
-        while let (Some(pattern), Some(mut input)) = (pit.next(), inputs.get(si)) {
+        while let Some(pattern) = pit.next() {
             match pattern {
-                Pattern::Ellipsis(inner) => {
-                    while let Some(e) = inner.try_match(input.clone()) {
+                Pattern::Ellipsis(inner) => if si < inputs.len() {
+                    while let Some(e) = inner.try_match(&inputs[si]) {
                         for (k, v) in e {
                             match env.get_mut(k) {
                                 Some(MatchValue::Many(vs)) => vs.push(v),
@@ -266,17 +302,18 @@ impl<'a> Pattern {
                         }
 
                         si += 1;
-                        if let Some(n) = inputs.get(si) {
-                            input = n;
-                        } else {
+                        if si >= inputs.len() {
                             break;
                         }
                     }
                 },
-                pattern => match pattern.try_match(input.clone()) {
-                    Some(e) => {
-                        env.extend(e);
-                        si += 1;
+                _ => match inputs.get(si) {
+                    Some(stx) => match pattern.try_match(stx) {
+                        Some(e) => {
+                            env.extend(e);
+                            si += 1;
+                        },
+                        None => return None,
                     },
                     None => return None,
                 }
@@ -348,6 +385,7 @@ impl<'a> Pattern {
                 Self::from_sequence(&stx.children[..stx.children.len()-1], literals)?,
                 Box::new(Self::from(stx.children.last().unwrap(), literals)?),
             )),
+            Datum::Quote | Datum::Quasiquote | Datum::Unquote | Datum::UnquoteSplicing => Err(()),
         }
     }
 }
@@ -372,14 +410,14 @@ impl Template {
         Ok(res)
     }
 
-    fn from_template(stx: &Rc<SyntaxObject>, literal_ellipsis: bool) -> Result<Self, ()> {
+    fn from_syntax(stx: &Rc<SyntaxObject>, literal_ellipsis: bool) -> Result<Self, ()> {
         match &stx.e {
             Datum::Symbol(s) => Ok(Template::Identifier(s.clone())),
             Datum::List => {
                 match stx.children.first().map(|e| &e.e) {
                     Some(Datum::Symbol(head)) if head == "..." => {
                         if let Some(stx) = stx.children.get(1) {
-                            Self::from_template(stx, true)
+                            Self::from_syntax(stx, true)
                         } else {
                             Err(())
                         }
@@ -392,12 +430,12 @@ impl Template {
                 Box::new(Self::from(stx.children.last().unwrap())?),
             )),
             Datum::Vector => Ok(Template::Vector(Self::from_sequence(&stx.children, literal_ellipsis)?)),
-            _ => Ok(Template::Constant(stx.e.clone())),
+            _ => Ok(Template::Constant(stx.clone())),
         }
     }
 
     fn from(stx: &Rc<SyntaxObject>) -> Result<Self, ()> {
-        Self::from_template(stx, false)
+        Self::from_syntax(stx, false)
     }
 
     fn count_ellipsis_repetition(&self, env: &MatchSlice) -> Result<usize, ()> {
@@ -439,72 +477,67 @@ impl Template {
                                 MatchValue::Many(vs) => vs.get(i).unwrap(),
                             }))
                             .collect::<MatchSlice>();
-                        result.push(Rc::new(inner.apply(&env_slice, stx, expand_scope)?));
+                        result.push(inner.apply(&env_slice, stx, expand_scope)?);
                     }
                 },
-                _ => result.push(Rc::new(t.apply(env, stx, expand_scope)?)),
+                _ => result.push(t.apply(env, stx, expand_scope)?),
             }
         }
 
         Ok(result)
     }
-    fn apply(&self, env: &MatchSlice, stx: &Rc<SyntaxObject>, expand_scope: usize) -> Result<SyntaxObject, Error> {
+    fn apply(&self, env: &MatchSlice, stx: &Rc<SyntaxObject>, expand_scope: usize) -> Result<Rc<SyntaxObject>, Error> {
         match self {
-            Template::Constant(datum) => Ok(SyntaxObject {
-                e: datum.clone(),
-                children: vec![],
-                scopes: Default::default(),
-                source_location: stx.source_location,
-            }),
+            Template::Constant(stx) => Ok(stx.clone()),
             Template::Identifier(s) => match env.get(s.as_str()) {
-                Some(MatchValue::One(stx)) => Ok(SyntaxObject {
-                    e: stx.e.clone(),
-                    children: stx.children.iter().map(Rc::clone).collect(),
-                    scopes: stx.scopes.clone(),
-                    source_location: stx.source_location,
-                }),
-                None => Ok(SyntaxObject {
+                Some(MatchValue::One(stx)) => Ok(stx.clone()),
+                None => Ok(Rc::new(SyntaxObject {
                     e: Datum::Symbol(s.clone()),
                     children: vec![],
                     scopes: stx.scopes.iter().map(|sc| *sc).chain(std::iter::once(expand_scope)).collect(),
                     source_location: stx.source_location,
-                }),
+                })),
                 _ => Err(Error::BadSyntax(stx.clone())),
             }
             Template::Ellipsis(_) => unreachable!(),
-            Template::List(templates) => Ok(SyntaxObject {
+            Template::List(templates) => Ok(Rc::new(SyntaxObject {
                 e: Datum::List,
                 children: Self::apply_sequence(templates, env, stx, expand_scope)?,
                 scopes: Default::default(),
                 source_location: stx.source_location,
-            }),
-            Template::ImproperList(templates, template) => Ok(SyntaxObject {
+            })),
+            Template::ImproperList(templates, template) => Ok(Rc::new(SyntaxObject {
                 e: Datum::ImproperList,
                 children: Self::apply_sequence(templates, env, stx, expand_scope)?.into_iter()
-                    .chain(std::iter::once(Rc::new(template.apply(env, stx, expand_scope)?)))
+                    .chain(std::iter::once(template.apply(env, stx, expand_scope)?))
                     .collect(),
                 scopes: Default::default(),
                 source_location: stx.source_location,
-            }),
-            Template::Vector(templates) => Ok(SyntaxObject {
+            })),
+            Template::Vector(templates) => Ok(Rc::new(SyntaxObject {
                 e: Datum::Vector,
                 children: Self::apply_sequence(templates, env, stx, expand_scope)?,
                 scopes: Default::default(),
                 source_location: stx.source_location,
-            }),
+            })),
         }
     }
 }
 
 impl Environment {
     pub fn new() -> Self {
+        let mut bindings = (0..(crate::CoreForm::_MaxValue as u8))
+            .map(|cf| unsafe { std::mem::transmute(cf) })
+            .map(|cf: crate::CoreForm| (cf.to_string(), std::iter::once((ScopeSet::new(), crate::Binding::CoreForm(cf))).collect()))
+            .collect::<std::collections::HashMap<_, _>>();
+        bindings.insert("define-syntax".into(), std::iter::once((ScopeSet::default(), crate::Binding::ExpandOnlyCoreForm)).collect());
+        bindings.insert("letrec-syntax".into(), std::iter::once((ScopeSet::default(), crate::Binding::ExpandOnlyCoreForm)).collect());
+
         Self {
-            macros: std::collections::HashMap::new(),
-            bindings: CORE_FORMS.iter().enumerate()
-                .map(|(i, name)| (name.to_string(), std::iter::once((ScopeSet::new(), i)).collect()))
-                .collect(),
+            macros: std::collections::VecDeque::new(),
+            bindings,
             scope_counter: Cell::new(1),
-            binding_counter: Cell::new(CORE_FORMS.len()),
+            bound_id_counter: Cell::new(1),
         }
     }
 
@@ -513,12 +546,12 @@ impl Environment {
         self.scope_counter.set(scope + 1);
         scope
     }
-    fn new_binding(&self) -> usize {
-        let binding = self.binding_counter.get();
-        self.binding_counter.set(binding + 1);
-        binding
+    fn new_variable(&self) -> Binding {
+        let binding = self.bound_id_counter.get();
+        self.bound_id_counter.set(binding + 1);
+        Binding::Variable(binding)
     }
-    fn resolve(&self, stx: &Rc<SyntaxObject>) -> Result<Option<usize>, Error> {
+    fn resolve(&self, stx: &Rc<SyntaxObject>) -> Result<Option<crate::Binding>, Error> {
         let (name, mut candidates) = match &stx.e {
             Datum::Symbol(name) => match self.bindings.get(name) {
                 Some(bindings) => (name, bindings.iter().filter(|(c_scopes, _)| c_scopes.is_subset(&stx.scopes))),
@@ -538,155 +571,178 @@ impl Environment {
         }
     }
 
-    pub fn define_syntax(&mut self, s: SyntaxObject) -> Result<SyntaxObject, Error> {
-        let s = Rc::new(s);
-        if let Some(matches) = SYNTAX_DEFINITION_PATTERN.try_match(s.clone()) {
+    fn parse_syntax_definition(stx: Rc<SyntaxObject>) -> Result<Option<(String, Vec<Pattern>, Vec<Template>)>, Error> {
+        if let Some(matches) = SYNTAX_DEFINITION_PATTERN.try_match(&stx) {
             let name = match matches.get("name") {
-                Some(MatchValue::One(stx)) => {
-                    if let Datum::Symbol(name) = &stx.e {
+                Some(MatchValue::One(name_stx)) => {
+                    if let Datum::Symbol(name) = &name_stx.e {
                         name.clone()
                     } else {
-                        return Err(Error::BadSyntax(stx.clone()));
+                        return Err(Error::BadSyntax(name_stx.clone()));
                     }
                 },
-                _ => return Err(Error::BadSyntax(s)),
+                _ => unreachable!(),
             };
             let literals = match matches.get("literals") {
-                Some(MatchValue::One(stx)) => {
-                    stx.children.iter().map(|c| {
+                Some(MatchValue::One(literals_stx)) => {
+                    literals_stx.children.iter().map(|c| {
                         if let Datum::Symbol(s) = &c.e {
                             Ok(s.as_str())
                         } else {
-                            Err(Error::BadSyntax(stx.clone()))
+                            Err(Error::BadSyntax(literals_stx.clone()))
                         }
                     }).collect::<Result<std::collections::HashSet<_>, _>>()?
                 },
-                _ => return Err(Error::BadSyntax(s)),
+                _ => unreachable!(),
             };
             let patterns = match matches.get("pattern") {
                 Some(MatchValue::Many(vs)) => vs.iter().map(|v| match v {
-                    MatchValue::One(stx) => Pattern::from(stx, &literals).map_err(|_| Error::BadSyntax(stx.clone())),
-                    _ => Err(Error::BadSyntax(s.clone())),
+                    MatchValue::One(pattern_stx) => Pattern::from(pattern_stx, &literals).map_err(|_| Error::BadSyntax(pattern_stx.clone())),
+                    _ => unreachable!(),
                 }).collect::<Result<Vec<_>, _>>()?,
-                _ => return Err(Error::BadSyntax(s)),
+                _ => unreachable!(),
             };
             let templates = match matches.get("template") {
                 Some(MatchValue::Many(vs)) => vs.iter().map(|v| match v {
-                    MatchValue::One(stx) => Template::from(stx).map_err(|_| Error::BadSyntax(stx.clone())),
-                    _ => Err(Error::BadSyntax(s.clone())),
+                    MatchValue::One(template_stx) => Template::from(template_stx).map_err(|_| Error::BadSyntax(stx.clone())),
+                    _ => unreachable!(),
                 }).collect::<Result<Vec<_>, _>>()?,
-                _ => return Err(Error::BadSyntax(s)),
+                _ => unreachable!(),
             };
             if patterns.len() == templates.len() {
-                self.macros.insert(name, std::iter::zip(patterns, templates).collect());
-                Ok(SyntaxObject {
-                    e: Datum::Boolean(true),
-                    children: vec![],
-                    scopes: Default::default(),
-                    source_location: s.source_location
-                })
+                Ok(Some((name, patterns, templates)))
             } else {
-                Err(Error::BadSyntax(s))
+                Err(Error::BadSyntax(stx))
             }
         } else {
-            Ok(Rc::into_inner(s).unwrap())
+            Ok(None)
+        }
+    }
+    fn define_early(&mut self, stx: Rc<SyntaxObject>) -> Result<Rc<SyntaxObject>, Error> {
+        if let Some((name, patterns, templates)) = Self::parse_syntax_definition(stx.clone())? {
+            self.bindings.insert(name, std::iter::once((ScopeSet::default(), crate::Binding::SyntaxTransformer(self.macros.len()))).collect());
+            self.macros.push_back(std::iter::zip(patterns, templates).collect());
+            Ok(Rc::new(SyntaxObject::simple(Datum::Boolean(true), stx.source_location)))
+        } else if let Some(matches) = PRIMITIVE_DEFINITION_PATTERN.try_match(&stx) {
+            match matches.get("name") {
+                Some(MatchValue::Many(vs)) => {
+                    for v in vs {
+                        if let MatchValue::One(stx) = v {
+                            if let Datum::Symbol(name) = &stx.e {
+                                self.bindings.entry(name.clone()).or_default().insert(ScopeSet::default(), crate::Binding::CorePrimitive);
+                            }
+                        } else {
+                            unreachable!()
+                        }
+                    }
+                    Ok(Rc::new(SyntaxObject::simple(Datum::Boolean(true), stx.source_location)))
+                },
+                _ => return Err(Error::BadSyntax(stx)),
+            }
+        } else {
+            Ok(stx)
         }
     }
 
     fn expand_syntax_once(&self, stx: Rc<SyntaxObject>) -> Result<(Rc<SyntaxObject>, bool), Error> {
         match &stx.e {
             Datum::List | Datum::ImproperList | Datum::Vector if stx.children.len() > 0 => {
-                if let Datum::Symbol(name) = &stx.children.first().unwrap().e {
-                    if let Some(rules) = self.macros.get(name) {
-                        for (pattern, template) in rules {
-                            if let Some(pure_env) = pattern.try_match(stx.clone()) {
-                                let match_env = pure_env.iter()
-                                    .map(|(k, v)| (*k, v))
-                                    .collect();
-                                return template.apply(&match_env, &stx, self.new_scope())
-                                    .map(|stx| (Rc::new(stx), true));
-                            }
+                match self.resolve(stx.children.get(0).unwrap())? {
+                    Some(crate::Binding::SyntaxTransformer(index)) => self.macros.get(index).unwrap().iter()
+                        .find_map(|(pattern, template)| pattern.try_match(&stx).map(|e| (e, template)))
+                        .map(|(env, template)| {
+                            let slice = env.iter().map(|(k, v)| (*k, v)).collect();
+                            template.apply(&slice, &stx, self.new_scope())
+                        })
+                        .ok_or(Error::NoMatchingPattern(stx))?
+                        .map(|stx| (stx, true)),
+                    Some(crate::Binding::CoreForm(crate::CoreForm::Quote)) => Ok((stx, false)),
+                    Some(crate::Binding::CoreForm(crate::CoreForm::Quasiquote)) => Ok((stx, false)),
+                    Some(crate::Binding::ExpandOnlyCoreForm) => Ok((stx, false)), // define-syntax: nothing here to expand; letrec-syntax: we'll expand the body of this later, when it's a different form
+                    _ => {
+                        let mut children = Vec::with_capacity(stx.children.len());
+                        let mut modified = false;
+                        for c in &stx.children {
+                            let (c, modif) = self.expand_syntax_once(c.clone())?;
+                            children.push(c);
+                            modified |= modif;
                         }
-                        return Err(Error::NoMatchingPattern(stx));
+                        Ok((Rc::new(SyntaxObject {
+                            e: stx.e.clone(),
+                            children,
+                            scopes: stx.scopes.clone(),
+                            source_location: stx.source_location,
+                        }), modified))
                     }
                 }
-
-                let mut children = Vec::new();
-                let mut modified = false;
-                for c in &stx.children {
-                    let (c, modif) = self.expand_syntax_once(c.clone())?;
-                    children.push(c);
-                    modified |= modif;
-                }
-                Ok((Rc::new(SyntaxObject {
-                    e: stx.e.clone(),
-                    children,
-                    scopes: stx.scopes.clone(),
-                    source_location: stx.source_location,
-                }), modified))
             },
             _ => Ok((stx, false)),
         }
     }
     fn add_binding_scopes(&mut self, stx: &mut SyntaxObject) -> Result<(), Error> {
-        if stx.e == Datum::List || stx.e == Datum::ImproperList {
-            if self.resolve(stx.children.first().unwrap())?.is_some_and(|b| b == 0) {
-                let bind_scope = self.new_scope();
-                stx.children.iter_mut()
-                    .skip(1)
-                    .for_each(|c| Rc::make_mut(c).add_scope(bind_scope));
-                match stx.children.get(1).map(|c| &c.e) {
-                    None => return Err(Error::BadSyntax(stx.children[0].clone())),
-                    Some(Datum::Symbol(name)) => {
-                        let b = self.new_binding();
-                        self.bindings.entry(name.clone()).or_default()
-                            .insert(stx.children[1].scopes.clone(), b);
-                    },
-                    Some(Datum::List) | Some(Datum::ImproperList) => {
-                        stx.children.get(1).unwrap()
-                            .children.iter()
-                            .filter_map(|c| match &c.e {
-                                Datum::Symbol(name) => Some((name, &c.scopes)),
-                                _ => None,
-                            }).for_each(|(name, scopes)| {
-                                let b = self.new_binding();
-                                self.bindings.entry(name.to_string()).or_default()
-                                    .insert(scopes.clone(), b);
-                            });
-                    },
-                    Some(_) => return Err(Error::BadSyntax(stx.children[1].clone())),
-                }
+        if (stx.e == Datum::List || stx.e == Datum::ImproperList) && stx.children.len() > 0 {
+            match self.resolve(stx.children.first().unwrap())? {
+                Some(Binding::CoreForm(crate::CoreForm::Lambda)) => {
+                    let bind_scope = self.new_scope();
+
+                    // Add the binding scope to every identifier in this binding construct
+                    stx.children.iter_mut()
+                        .skip(1)
+                        .for_each(|c| Rc::make_mut(c).add_scope(bind_scope));
+
+                    // Record the binding for each new bound variable
+                    match stx.children.get(1).map(|c| &c.e) {
+                        None => return Err(Error::BadSyntax(stx.children[0].clone())),
+                        Some(Datum::Symbol(name)) => {
+                            let b = self.new_variable();
+                            match self.bindings.get_mut(name) {
+                                Some(bb) => bb,
+                                None => self.bindings.entry(name.clone()).or_default(),
+                            }.insert(stx.children[1].scopes.clone(), b);
+                        },
+                        Some(Datum::List) | Some(Datum::ImproperList) => {
+                            stx.children.get(1).unwrap()
+                                .children.iter()
+                                .filter_map(|c| match &c.e {
+                                    Datum::Symbol(name) => Some((name, &c.scopes)),
+                                    _ => None,
+                                }).for_each(|(name, scopes)| {
+                                    let b = self.new_variable();
+                                    match self.bindings.get_mut(name) {
+                                        Some(bb) => bb,
+                                        None => self.bindings.entry(name.clone()).or_default(),
+                                    }.insert(scopes.clone(), b);
+                                });
+                            },
+                        Some(_) => return Err(Error::BadSyntax(stx.children[1].clone())),
+                    };
+
+                    // Add binding scopes to any children of this expression
+                    stx.children.iter_mut()
+                        .map(|c| self.add_binding_scopes(Rc::make_mut(c)))
+                        .collect::<Result<(), _>>()?;
+                },
+                Some(Binding::CoreForm(crate::CoreForm::Begin)) => {
+                    let bind_scope = self.new_scope(); // This is needed for any definitions in the begin block.
+                    stx.children.iter_mut()
+                        .skip(1)
+                        .for_each(|c| Rc::make_mut(c).add_scope(bind_scope));
+                    stx.children.iter_mut()
+                        .map(|c| self.add_binding_scopes(Rc::make_mut(c)))
+                        .collect::<Result<(), _>>()?;
+                },
+                Some(Binding::CoreForm(crate::CoreForm::Quote | crate::CoreForm::Quasiquote)) => (),
+                Some(Binding::ExpandOnlyCoreForm) => (),
+                _ => {
+                    stx.children.iter_mut()
+                        .map(|c| self.add_binding_scopes(Rc::make_mut(c)))
+                        .collect::<Result<(), _>>()?;
+                },
             }
-            stx.children.iter_mut()
-                .map(|c| self.add_binding_scopes(Rc::make_mut(c)))
-                .collect::<Result<(), _>>()?;
         }
         Ok(())
     }
-    fn resolve_syntax(&self, stx: &Rc<SyntaxObject>) -> Result<crate::Expression, Error> {
-        match &**stx {
-            SyntaxObject { e: Datum::Boolean(b), .. } => Ok(crate::Expression::Boolean(*b)),
-            SyntaxObject { e: Datum::Integer(i), .. } => Ok(crate::Expression::Integer(*i)),
-            SyntaxObject { e: Datum::Rational(n, d), .. } => Ok(crate::Expression::Rational(*n, *d)),
-            SyntaxObject { e: Datum::Float(f), .. } => Ok(crate::Expression::Float(*f)),
-            SyntaxObject { e: Datum::Character(c), .. } => Ok(crate::Expression::Character(*c)),
-            SyntaxObject { e: Datum::String(s), .. } => Ok(crate::Expression::String(s.clone())),
-            SyntaxObject { e: Datum::Bytes(b), .. } => Ok(crate::Expression::Bytes(b.clone())),
-            SyntaxObject { e: Datum::Symbol(name), .. } => {
-                let binding = self.resolve(stx)?.ok_or_else(|| Error::UnrecognizedIdentifier(stx.clone()))?;
-                Ok(crate::Expression::Symbol(format!("{}{}", name, binding)))
-            },
-            SyntaxObject { e: Datum::List, children, .. } => Ok(crate::Expression::List(children.iter().map(|c| self.resolve_syntax(c)).collect::<Result<Vec<_>, _>>()?)),
-            SyntaxObject { e: Datum::Vector, children, .. } => Ok(crate::Expression::Vector(children.iter().map(|c| self.resolve_syntax(c)).collect::<Result<Vec<_>, _>>()?)),
-            SyntaxObject { e: Datum::ImproperList, children, .. } => {
-                let mut children = children.iter().map(|c| self.resolve_syntax(c)).collect::<Result<Vec<_>, _>>()?;
-                let tail = Box::new(children.pop().unwrap());
-                Ok(crate::Expression::ImproperList(children, tail))
-            },
-        }
-    }
-    pub fn expand_syntax(&mut self, s: SyntaxObject) -> Result<crate::Expression, Error> {
-        let mut stx = Rc::new(s);
+    fn expand_and_scope(&mut self, mut stx: Rc<SyntaxObject>) -> Result<Rc<SyntaxObject>, Error> {
         let mut expanded = loop {
             match self.expand_syntax_once(stx)? {
                 (ns, true) => stx = ns,
@@ -695,7 +751,120 @@ impl Environment {
         };
 
         self.add_binding_scopes(Rc::make_mut(&mut expanded))?;
-        self.resolve_syntax(&expanded)
+        Ok(expanded)
+    }
+
+    fn define_inner(&mut self, mut stx: Rc<SyntaxObject>) -> Result<Rc<SyntaxObject>, Error> {
+        if let Some((name, patterns, templates)) = Self::parse_syntax_definition(stx.clone())? {
+            match self.bindings.get_mut(&name) {
+                Some(bb) => bb.insert(stx.scopes.clone(), crate::Binding::SyntaxTransformer(self.macros.len())).map(|_| ()),
+                None => self.bindings.insert(name, std::iter::once((stx.scopes.clone(), crate::Binding::SyntaxTransformer(self.macros.len()))).collect()).map(|_| ()),
+            };
+            self.macros.push_back(std::iter::zip(patterns, templates).collect());
+            Ok(Rc::new(SyntaxObject::simple(Datum::Boolean(true), stx.source_location)))
+        } else if let Some(matches) = VALUE_DEFINITION_PATTERN.try_match(&stx) {
+            match matches.get("formals") {
+                Some(MatchValue::Many(vs)) => {
+                    for v in vs {
+                        match v {
+                            MatchValue::One(stx) => match &**stx {
+                                SyntaxObject { e: Datum::Symbol(name), scopes, ..} => match self.bindings.get_mut(name) {
+                                    Some(bb) => bb,
+                                    None => self.bindings.entry(name.clone()).or_default(),
+                                }.insert(scopes.clone(), crate::Binding::SyntaxTransformer(self.macros.len())),
+                                _ => None,
+                            },
+                            _ => None,
+                        };
+                    }
+                    Ok(stx)
+                },
+                _ => unreachable!(),
+            }
+        } else if let Some(matches) = SYNTAX_BINDING_PATTERN.try_match(&stx) {
+            let bind_scope = self.new_scope();
+            let body_scopes: ScopeSet = stx.scopes.iter().map(|sc| *sc).chain(std::iter::once(bind_scope)).collect();
+            let names = match matches.get("name") {
+                Some(MatchValue::Many(vs)) => vs.iter().map(|v| match v {
+                    MatchValue::One(stx) => match &**stx {
+                        SyntaxObject { e: Datum::Symbol(name), .. } => Ok(name.clone()),
+                        _ => Err(Error::BadSyntax(stx.clone())),
+                    },
+                    _ => Err(Error::BadSyntax(stx.clone())),
+                }).collect::<Result<Vec<_>, _>>()?,
+                _ => unreachable!(),
+            };
+            for (i, name) in names.iter().enumerate() {
+                match self.bindings.get_mut(name) {
+                    Some(bb) => bb,
+                    None => self.bindings.entry(name.clone()).or_default(),
+                }.insert(body_scopes.clone(), crate::Binding::SyntaxTransformer(self.macros.len() + i));
+            }
+
+            let literals = match matches.get("literals") {
+                Some(MatchValue::Many(vs)) => vs.iter().map(|v| match v {
+                    MatchValue::One(literals_stx) => literals_stx.children.iter()
+                        .map(|c| if let Datum::Symbol(s) = &c.e {
+                            Ok(s.as_str())
+                        } else {
+                            Err(Error::BadSyntax(literals_stx.clone()))
+                        }).collect::<Result<std::collections::HashSet<_>, Error>>(),
+                    _ => unreachable!(),
+                }).collect::<Result<Vec<_>, Error>>()?,
+                _ => unreachable!(),
+            };
+            let patterns = match matches.get("pattern") {
+                Some(MatchValue::Many(vs)) => vs.iter().enumerate().map(|(i, v)| match v {
+                    MatchValue::Many(vs) => vs.iter().map(|v| match v {
+                        MatchValue::One(pattern_stx) => Pattern::from(pattern_stx, &literals[i]).map_err(|_| Error::BadSyntax(pattern_stx.clone())),
+                        _ => unreachable!(),
+                    }).collect::<Result<Vec<_>, Error>>(),
+                    _ => unreachable!(),
+                }).collect::<Result<Vec<_>, Error>>()?,
+                _ => unreachable!(),
+            };
+            let templates = match matches.get("template") {
+                Some(MatchValue::Many(vs)) => vs.iter().map(|v| match v {
+                    MatchValue::Many(vs) => vs.iter().map(|v| match v {
+                        MatchValue::One(template_stx) => Template::from(template_stx).map_err(|_| Error::BadSyntax(template_stx.clone())),
+                        _ => unreachable!(),
+                    }).collect::<Result<Vec<_>, Error>>(),
+                    _ => unreachable!(),
+                }).collect::<Result<Vec<_>, Error>>()?,
+                _ => unreachable!(),
+            };
+            if names.len() != patterns.len() || patterns.len() != templates.len() || names.len() != templates.len() {
+                return Err(Error::BadSyntax(stx));
+            }
+            for (p, t) in std::iter::zip(patterns, templates) {
+                self.macros.push_back(std::iter::zip(p, t).collect());
+            }
+
+            let mut bodys = vec![CORE_FORM_BEGIN_STX.with(|c| LazyCell::force(c).clone())];
+            bodys.extend(match matches.get("body") {
+                Some(MatchValue::Many(vs)) => vs.iter().map(|v| match v {
+                    MatchValue::One(stx) => stx.clone(),
+                    _ => unreachable!(),
+                }),
+                _ => unreachable!(),
+            });
+            bodys.iter_mut().skip(1).for_each(|stx| Rc::make_mut(stx).add_scope(bind_scope));
+            Ok(Rc::new(SyntaxObject {
+                e: Datum::List,
+                children: bodys,
+                scopes: body_scopes,
+                source_location: (0, 0),
+            }))
+        } else {
+            Rc::make_mut(&mut stx).children = stx.children.iter()
+                .map(|stx| self.define_inner(stx.clone()))
+                .collect::<Result<Vec<_>, Error>>()?;
+            Ok(stx)
+        }
+    }
+
+    fn resolve_syntax(&self, _stx: Rc<SyntaxObject>) -> Result<crate::Expression, Error> {
+        Ok(crate::Expression::Boolean(false))
     }
 }
 
@@ -768,18 +937,10 @@ fn read_datum(port: &mut InputPort, token: Option<(Token, (usize, usize))>) -> R
                 }
             }
         },
-        Token::Quote => Ok(SyntaxObject::compound(Datum::List,
-            vec![SyntaxObject::simple(Datum::Symbol("quote".to_string()), source_location), read_datum(port, None)?],
-            source_location)),
-        Token::Backquote => Ok(SyntaxObject::compound(Datum::List,
-            vec![SyntaxObject::simple(Datum::Symbol("quasiquote".to_string()), source_location), read_datum(port, None)?],
-            source_location)),
-        Token::Unquote => Ok(SyntaxObject::compound(Datum::List,
-            vec![SyntaxObject::simple(Datum::Symbol("unquote".to_string()), source_location), read_datum(port, None)?],
-            source_location)),
-        Token::UnquoteSplicing => Ok(SyntaxObject::compound(Datum::List,
-            vec![SyntaxObject::simple(Datum::Symbol("unquote-splicing".to_string()), source_location), read_datum(port, None)?],
-            source_location)),
+        Token::Quote => Ok(SyntaxObject::compound(Datum::Quote, vec![read_datum(port, None)?], source_location)),
+        Token::Backquote => Ok(SyntaxObject::compound(Datum::Quasiquote, vec![read_datum(port, None)?], source_location)),
+        Token::Unquote => Ok(SyntaxObject::compound(Datum::Unquote, vec![read_datum(port, None)?], source_location)),
+        Token::UnquoteSplicing => Ok(SyntaxObject::compound(Datum::UnquoteSplicing, vec![read_datum(port, None)?], source_location)),
         _ => Err(Error::UnexpectedToken),
     }
 }
@@ -1494,4 +1655,18 @@ fn radix(port: &mut InputPort, offset: usize, base: i32) -> Result<Option<usize>
     } else {
         Ok(None)
     }
+}
+
+/******** expander ********/
+
+pub fn expand(stx: SyntaxObject, env: &mut Environment) -> Result<crate::Expression, Error>
+{
+    eprintln!("step1: {}", stx);
+    let stx = env.define_early(Rc::new(stx))?;
+    let stx = env.expand_and_scope(stx)?;
+    eprintln!("step2: {}", stx);
+    let stx = env.define_inner(stx)?;
+    let stx = env.expand_and_scope(stx)?;
+    eprintln!("step3: {}", stx);
+    env.resolve_syntax(stx)
 }
