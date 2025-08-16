@@ -1,4 +1,3 @@
-use crate::Binding;
 use crate::io::InputPort;
 use std::cell::{Cell, LazyCell};
 use std::rc::Rc;
@@ -19,9 +18,48 @@ pub struct SyntaxObject {
 #[derive(Debug)]
 pub struct Environment {
     macros: std::collections::VecDeque<SyntaxRules>,
-    bindings: std::collections::HashMap<String, std::collections::BTreeMap<ScopeSet, crate::Binding>>,
+    bindings: std::collections::HashMap<String, std::collections::BTreeMap<ScopeSet, Binding>>,
     scope_counter: Cell<usize>,
     bound_id_counter: Cell<usize>,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub enum Binding {
+    CoreForm(CoreForm),
+    ExpandOnlyCoreForm,
+    CorePrimitive(&'static str),
+    SyntaxTransformer(usize),
+    Variable(usize),
+}
+
+#[repr(u8)] #[derive(Debug, Clone, Copy)]
+pub enum CoreForm {
+    Lambda,
+    If,
+    Begin,
+    SetBang,
+    Quote,
+    Quasiquote,
+    Unquote,
+    UnquoteSplicing,
+    DefineValues,
+    _MaxValue,
+}
+impl std::fmt::Display for CoreForm {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            CoreForm::Lambda => write!(f, "lambda"),
+            CoreForm::If => write!(f, "if"),
+            CoreForm::Begin => write!(f, "begin"),
+            CoreForm::SetBang => write!(f, "set!"),
+            CoreForm::Quote => write!(f, "quote"),
+            CoreForm::Quasiquote => write!(f, "quasiquote"),
+            CoreForm::Unquote => write!(f, "unquote"),
+            CoreForm::UnquoteSplicing => write!(f, "unquote-splicing"),
+            CoreForm::DefineValues => write!(f, "define-values"),
+            CoreForm::_MaxValue => panic!(),
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -33,8 +71,10 @@ pub enum Error {
     InvalidCharacter,
 
     BadSyntax(Rc<SyntaxObject>),
+    BadCoreFormSyntax(CoreForm, Rc<SyntaxObject>),
     AmbiguousBinding(String),
     NoMatchingPattern(Rc<SyntaxObject>),
+    UnboundIdentifier(Rc<SyntaxObject>),
 }
 impl std::fmt::Display for Error {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -44,9 +84,14 @@ impl std::fmt::Display for Error {
             Error::IoError(e) => write!(f, "I/O error: {}", e),
             Error::InvalidNumber(msg) => write!(f, "Invalid number: {}", msg),
             Error::InvalidCharacter => write!(f, "Invalid character"),
-            Error::BadSyntax(stx) => write!(f, "Bad syntax: {}", stx),
+            Error::BadSyntax(stx) => write!(f, "Bad syntax at {}:{}: {}", stx.source_location.0, stx.source_location.1, stx),
+            Error::BadCoreFormSyntax(c, stx) => write!(f, "Bad core-form syntax for {} at {}:{}: {}", c, stx.source_location.0, stx.source_location.1, stx),
             Error::AmbiguousBinding(name) => write!(f, "Bad syntax due to ambiguous binding: {}", name),
             Error::NoMatchingPattern(stx) => write!(f, "No macro expansion for pattern: {}", stx),
+            Error::UnboundIdentifier(stx) => match &stx.e {
+                Datum::Symbol(name) => write!(f, "Unbound identifier: {} at {}:{}", name, stx.source_location.0, stx.source_location.1),
+                _ => unreachable!(),
+            }
         }
     }
 }
@@ -165,6 +210,9 @@ static SYNTAX_BINDING_PATTERN: std::sync::LazyLock<Pattern> = std::sync::LazyLoc
         ]))),
     ]),
 ], Box::new(Pattern::Variable("body".into()))));
+static CORE_PRIMITIVES: std::sync::LazyLock<std::collections::HashSet<String>> = std::sync::LazyLock::new(|| [
+    "*", "+", "-",
+].map(|f: &'static str| f.to_string()).into());
 
 thread_local! {
     static CORE_FORM_BEGIN_STX: LazyCell<Rc<SyntaxObject>> = const { LazyCell::new(|| Rc::new(SyntaxObject { e: Datum::Symbol("begin".into()), children: vec![], scopes: Default::default(), source_location: (0, 0)})) };
@@ -526,12 +574,12 @@ impl Template {
 
 impl Environment {
     pub fn new() -> Self {
-        let mut bindings = (0..(crate::CoreForm::_MaxValue as u8))
+        let mut bindings = (0..(CoreForm::_MaxValue as u8))
             .map(|cf| unsafe { std::mem::transmute(cf) })
-            .map(|cf: crate::CoreForm| (cf.to_string(), std::iter::once((ScopeSet::new(), crate::Binding::CoreForm(cf))).collect()))
+            .map(|cf: CoreForm| (cf.to_string(), std::iter::once((ScopeSet::new(), Binding::CoreForm(cf))).collect()))
             .collect::<std::collections::HashMap<_, _>>();
-        bindings.insert("define-syntax".into(), std::iter::once((ScopeSet::default(), crate::Binding::ExpandOnlyCoreForm)).collect());
-        bindings.insert("letrec-syntax".into(), std::iter::once((ScopeSet::default(), crate::Binding::ExpandOnlyCoreForm)).collect());
+        bindings.insert("define-syntax".into(), std::iter::once((ScopeSet::default(), Binding::ExpandOnlyCoreForm)).collect());
+        bindings.insert("letrec-syntax".into(), std::iter::once((ScopeSet::default(), Binding::ExpandOnlyCoreForm)).collect());
 
         Self {
             macros: std::collections::VecDeque::new(),
@@ -551,7 +599,7 @@ impl Environment {
         self.bound_id_counter.set(binding + 1);
         Binding::Variable(binding)
     }
-    fn resolve(&self, stx: &Rc<SyntaxObject>) -> Result<Option<crate::Binding>, Error> {
+    fn resolve(&self, stx: &Rc<SyntaxObject>) -> Result<Option<Binding>, Error> {
         let (name, mut candidates) = match &stx.e {
             Datum::Symbol(name) => match self.bindings.get(name) {
                 Some(bindings) => (name, bindings.iter().filter(|(c_scopes, _)| c_scopes.is_subset(&stx.scopes))),
@@ -620,7 +668,7 @@ impl Environment {
     }
     fn define_early(&mut self, stx: Rc<SyntaxObject>) -> Result<Rc<SyntaxObject>, Error> {
         if let Some((name, patterns, templates)) = Self::parse_syntax_definition(stx.clone())? {
-            self.bindings.insert(name, std::iter::once((ScopeSet::default(), crate::Binding::SyntaxTransformer(self.macros.len()))).collect());
+            self.bindings.insert(name, std::iter::once((ScopeSet::default(), Binding::SyntaxTransformer(self.macros.len()))).collect());
             self.macros.push_back(std::iter::zip(patterns, templates).collect());
             Ok(Rc::new(SyntaxObject::simple(Datum::Boolean(true), stx.source_location)))
         } else if let Some(matches) = PRIMITIVE_DEFINITION_PATTERN.try_match(&stx) {
@@ -629,7 +677,11 @@ impl Environment {
                     for v in vs {
                         if let MatchValue::One(stx) = v {
                             if let Datum::Symbol(name) = &stx.e {
-                                self.bindings.entry(name.clone()).or_default().insert(ScopeSet::default(), crate::Binding::CorePrimitive);
+                                match CORE_PRIMITIVES.get(name) {
+                                    Some(s) => self.bindings.entry(name.clone()).or_default()
+                                        .insert(ScopeSet::default(), Binding::CorePrimitive(s.as_str())),
+                                    None => return Err(Error::AmbiguousBinding(name.clone())),
+                                };
                             }
                         } else {
                             unreachable!()
@@ -637,52 +689,115 @@ impl Environment {
                     }
                     Ok(Rc::new(SyntaxObject::simple(Datum::Boolean(true), stx.source_location)))
                 },
-                _ => return Err(Error::BadSyntax(stx)),
+                _ => unreachable!(),
             }
         } else {
             Ok(stx)
         }
     }
 
-    fn expand_syntax_once(&self, stx: Rc<SyntaxObject>) -> Result<(Rc<SyntaxObject>, bool), Error> {
-        match &stx.e {
-            Datum::List | Datum::ImproperList | Datum::Vector if stx.children.len() > 0 => {
-                match self.resolve(stx.children.get(0).unwrap())? {
-                    Some(crate::Binding::SyntaxTransformer(index)) => self.macros.get(index).unwrap().iter()
-                        .find_map(|(pattern, template)| pattern.try_match(&stx).map(|e| (e, template)))
-                        .map(|(env, template)| {
-                            let slice = env.iter().map(|(k, v)| (*k, v)).collect();
-                            template.apply(&slice, &stx, self.new_scope())
-                        })
-                        .ok_or(Error::NoMatchingPattern(stx))?
-                        .map(|stx| (stx, true)),
-                    Some(crate::Binding::CoreForm(crate::CoreForm::Quote)) => Ok((stx, false)),
-                    Some(crate::Binding::CoreForm(crate::CoreForm::Quasiquote)) => Ok((stx, false)),
-                    Some(crate::Binding::ExpandOnlyCoreForm) => Ok((stx, false)), // define-syntax: nothing here to expand; letrec-syntax: we'll expand the body of this later, when it's a different form
-                    _ => {
-                        let mut children = Vec::with_capacity(stx.children.len());
-                        let mut modified = false;
-                        for c in &stx.children {
-                            let (c, modif) = self.expand_syntax_once(c.clone())?;
-                            children.push(c);
-                            modified |= modif;
-                        }
-                        Ok((Rc::new(SyntaxObject {
-                            e: stx.e.clone(),
-                            children,
-                            scopes: stx.scopes.clone(),
-                            source_location: stx.source_location,
-                        }), modified))
-                    }
+    fn expand_qq_syntax(&self, mut stx: Rc<SyntaxObject>, qq_depth: usize) -> Result<(Rc<SyntaxObject>, bool), Error> {
+        if qq_depth == 0 {
+            return self.expand_syntax_once(stx);
+        }
+
+        if matches!(stx.e, Datum::List | Datum::ImproperList) {
+            let head = match stx.children.first() {
+                None => return Ok((stx, false)),
+                Some(head) => self.resolve(head)?,
+            };
+            if matches!(head, Some(Binding::CoreForm(CoreForm::Quasiquote))) {
+                let (child, modified) = self.expand_qq_syntax(stx.children[1].clone(), qq_depth + 1)?;
+                if modified {
+                    Rc::make_mut(&mut stx).children[1] = child;
                 }
-            },
-            _ => Ok((stx, false)),
+                return Ok((stx, modified));
+            }
+            if matches!(head, Some(Binding::CoreForm(CoreForm::Unquote | CoreForm::UnquoteSplicing))) {
+                let (child, modified) = self.expand_qq_syntax(stx.children[1].clone(), qq_depth - 1)?;
+                if modified {
+                    Rc::make_mut(&mut stx).children[1] = child;
+                }
+                return Ok((stx, modified));
+            }
+        }
+
+        if stx.children.len() > 0 {
+            let qq_depth = match &stx.e {
+                Datum::Quasiquote => qq_depth + 1,
+                Datum::Unquote | Datum::UnquoteSplicing => qq_depth - 1,
+                _ => qq_depth,
+            };
+
+            let mut children = Vec::with_capacity(stx.children.len());
+            let mut any_modified = false;
+            for c in &stx.children {
+                let (child, modified) = self.expand_qq_syntax(c.clone(), qq_depth)?;
+                children.push(child);
+                any_modified |= modified;
+            }
+            if any_modified {
+                Rc::make_mut(&mut stx).children = children;
+            }
+            Ok((stx, any_modified))
+        } else {
+            Ok((stx, false))
+        }
+    }
+    fn expand_syntax_once(&self, mut stx: Rc<SyntaxObject>) -> Result<(Rc<SyntaxObject>, bool), Error> {
+        if matches!(stx.e, Datum::List | Datum::ImproperList) {
+            let head = match stx.children.first() {
+                None => return Ok((stx, false)),
+                Some(head) => self.resolve(head)?,
+            };
+            if let Some(Binding::SyntaxTransformer(index)) = head {
+                return self.macros.get(index).unwrap().iter()
+                    .find_map(|(pattern, template)| pattern.try_match(&stx).map(|e| (e, template)))
+                    .map(|(env, template)| {
+                        let slice = env.iter().map(|(k, v)| (*k, v)).collect();
+                        template.apply(&slice, &stx, self.new_scope())
+                    })
+                    .ok_or(Error::NoMatchingPattern(stx))?
+                    .map(|stx| (stx, true));
+            } else if matches!(head, Some(Binding::CoreForm(CoreForm::Quasiquote))) {
+                let (child, modified) = self.expand_qq_syntax(stx.children[1].clone(), 1)?;
+                if modified {
+                    Rc::make_mut(&mut stx).children[1] = child;
+                }
+                return Ok((stx, modified));
+            } else if matches!(head, Some(Binding::CoreForm(CoreForm::Quote) | Binding::ExpandOnlyCoreForm)) {
+                return Ok((stx, false));
+            }
+        } else if matches!(stx.e, Datum::Quote) {
+            return Ok((stx, false));
+        } else if matches!(stx.e, Datum::Quasiquote) {
+            let (child, modified) = self.expand_qq_syntax(stx.children[0].clone(), 1)?;
+            if modified {
+                Rc::make_mut(&mut stx).children[0] = child;
+            }
+            return Ok((stx, modified));
+        }
+
+        if stx.children.len() > 0 {
+            let mut children = Vec::with_capacity(stx.children.len());
+            let mut any_modified = false;
+            for c in &stx.children {
+                let (child, modified) = self.expand_syntax_once(c.clone())?;
+                children.push(child);
+                any_modified |= modified;
+            }
+            if any_modified {
+                Rc::make_mut(&mut stx).children = children;
+            }
+            Ok((stx, any_modified))
+        } else {
+            Ok((stx, false))
         }
     }
     fn add_binding_scopes(&mut self, stx: &mut SyntaxObject) -> Result<(), Error> {
         if (stx.e == Datum::List || stx.e == Datum::ImproperList) && stx.children.len() > 0 {
             match self.resolve(stx.children.first().unwrap())? {
-                Some(Binding::CoreForm(crate::CoreForm::Lambda)) => {
+                Some(Binding::CoreForm(CoreForm::Lambda)) => {
                     let bind_scope = self.new_scope();
 
                     // Add the binding scope to every identifier in this binding construct
@@ -692,7 +807,7 @@ impl Environment {
 
                     // Record the binding for each new bound variable
                     match stx.children.get(1).map(|c| &c.e) {
-                        None => return Err(Error::BadSyntax(stx.children[0].clone())),
+                        None => return Err(Error::BadCoreFormSyntax(CoreForm::Lambda, stx.children[1].clone())),
                         Some(Datum::Symbol(name)) => {
                             let b = self.new_variable();
                             match self.bindings.get_mut(name) {
@@ -714,7 +829,7 @@ impl Environment {
                                     }.insert(scopes.clone(), b);
                                 });
                             },
-                        Some(_) => return Err(Error::BadSyntax(stx.children[1].clone())),
+                        Some(_) => return Err(Error::BadCoreFormSyntax(CoreForm::Lambda, stx.children[1].clone())),
                     };
 
                     // Add binding scopes to any children of this expression
@@ -722,7 +837,7 @@ impl Environment {
                         .map(|c| self.add_binding_scopes(Rc::make_mut(c)))
                         .collect::<Result<(), _>>()?;
                 },
-                Some(Binding::CoreForm(crate::CoreForm::Begin)) => {
+                Some(Binding::CoreForm(CoreForm::Begin)) => {
                     let bind_scope = self.new_scope(); // This is needed for any definitions in the begin block.
                     stx.children.iter_mut()
                         .skip(1)
@@ -731,8 +846,7 @@ impl Environment {
                         .map(|c| self.add_binding_scopes(Rc::make_mut(c)))
                         .collect::<Result<(), _>>()?;
                 },
-                Some(Binding::CoreForm(crate::CoreForm::Quote | crate::CoreForm::Quasiquote)) => (),
-                Some(Binding::ExpandOnlyCoreForm) => (),
+                Some(Binding::CoreForm(CoreForm::Quote) | Binding::ExpandOnlyCoreForm) => (),
                 _ => {
                     stx.children.iter_mut()
                         .map(|c| self.add_binding_scopes(Rc::make_mut(c)))
@@ -757,8 +871,8 @@ impl Environment {
     fn define_inner(&mut self, mut stx: Rc<SyntaxObject>) -> Result<Rc<SyntaxObject>, Error> {
         if let Some((name, patterns, templates)) = Self::parse_syntax_definition(stx.clone())? {
             match self.bindings.get_mut(&name) {
-                Some(bb) => bb.insert(stx.scopes.clone(), crate::Binding::SyntaxTransformer(self.macros.len())).map(|_| ()),
-                None => self.bindings.insert(name, std::iter::once((stx.scopes.clone(), crate::Binding::SyntaxTransformer(self.macros.len()))).collect()).map(|_| ()),
+                Some(bb) => bb.insert(stx.scopes.clone(), Binding::SyntaxTransformer(self.macros.len())).map(|_| ()),
+                None => self.bindings.insert(name, std::iter::once((stx.scopes.clone(), Binding::SyntaxTransformer(self.macros.len()))).collect()).map(|_| ()),
             };
             self.macros.push_back(std::iter::zip(patterns, templates).collect());
             Ok(Rc::new(SyntaxObject::simple(Datum::Boolean(true), stx.source_location)))
@@ -771,7 +885,7 @@ impl Environment {
                                 SyntaxObject { e: Datum::Symbol(name), scopes, ..} => match self.bindings.get_mut(name) {
                                     Some(bb) => bb,
                                     None => self.bindings.entry(name.clone()).or_default(),
-                                }.insert(scopes.clone(), crate::Binding::SyntaxTransformer(self.macros.len())),
+                                }.insert(scopes.clone(), Binding::SyntaxTransformer(self.macros.len())),
                                 _ => None,
                             },
                             _ => None,
@@ -788,9 +902,9 @@ impl Environment {
                 Some(MatchValue::Many(vs)) => vs.iter().map(|v| match v {
                     MatchValue::One(stx) => match &**stx {
                         SyntaxObject { e: Datum::Symbol(name), .. } => Ok(name.clone()),
-                        _ => Err(Error::BadSyntax(stx.clone())),
+                        _ => unreachable!(),
                     },
-                    _ => Err(Error::BadSyntax(stx.clone())),
+                    _ => unreachable!(),
                 }).collect::<Result<Vec<_>, _>>()?,
                 _ => unreachable!(),
             };
@@ -798,7 +912,7 @@ impl Environment {
                 match self.bindings.get_mut(name) {
                     Some(bb) => bb,
                     None => self.bindings.entry(name.clone()).or_default(),
-                }.insert(body_scopes.clone(), crate::Binding::SyntaxTransformer(self.macros.len() + i));
+                }.insert(body_scopes.clone(), Binding::SyntaxTransformer(self.macros.len() + i));
             }
 
             let literals = match matches.get("literals") {
@@ -863,8 +977,217 @@ impl Environment {
         }
     }
 
-    fn resolve_syntax(&self, _stx: Rc<SyntaxObject>) -> Result<crate::Expression, Error> {
-        Ok(crate::Expression::Boolean(false))
+    fn quote_syntax(&self, stx: &Rc<SyntaxObject>, qq_depth: usize) -> Result<crate::Expression, Error> {
+        if qq_depth == 0 {
+            self.resolve_syntax(stx)
+        } else {
+            match &stx.e {
+                Datum::Boolean(b) => Ok(crate::Expression::Boolean(*b)),
+                Datum::Integer(i) => Ok(crate::Expression::Integer(*i)),
+                Datum::Rational(n, d) => Ok(crate::Expression::Rational(*n, *d)),
+                Datum::Float(f) => Ok(crate::Expression::Float(*f)),
+                Datum::Character(c) => Ok(crate::Expression::Character(*c)),
+                Datum::String(s) => Ok(crate::Expression::String(s.clone())),
+                Datum::Symbol(s) => Ok(crate::Expression::Symbol(s.clone())),
+                Datum::Bytes(items) => Ok(crate::Expression::Bytes(items.clone())),
+                Datum::List => match stx.children.first() {
+                    Some(head) => match self.resolve(head)? {
+                        Some(Binding::CoreForm(CoreForm::Quote)) if stx.children.len() > 1 => Ok(crate::Expression::Quotation(Box::new(self.quote_syntax(&stx.children[1], usize::MAX)?))),
+                        Some(Binding::CoreForm(CoreForm::Quasiquote)) if stx.children.len() > 1 => Ok(crate::Expression::Quasiquotation(Box::new(self.quote_syntax(&stx.children[1], qq_depth + 1)?))),
+                        Some(Binding::CoreForm(CoreForm::Unquote)) if stx.children.len() > 1 => Ok(crate::Expression::Unquotation(Box::new(self.quote_syntax(&stx.children[1], qq_depth - 1)?))),
+                        Some(Binding::CoreForm(CoreForm::UnquoteSplicing)) if stx.children.len() > 1 => Ok(crate::Expression::SplicingUnquotation(Box::new(self.quote_syntax(&stx.children[1], qq_depth - 1)?))),
+                        _ => Ok(crate::Expression::ListDatum(stx.children.iter()
+                            .map(|stx| self.quote_syntax(stx, qq_depth)).collect::<Result<Vec<_>, _>>()?, None)),
+                    },
+                    None => Ok(crate::Expression::ListDatum(Vec::new(), None)),
+                },
+                Datum::ImproperList => {
+                    let mut children = stx.children.iter()
+                        .map(|stx| self.quote_syntax(stx, qq_depth)).collect::<Result<Vec<_>, _>>()?;
+                    let tail = children.pop().map(Box::new);
+                    Ok(crate::Expression::ListDatum(children, tail))
+                },
+                Datum::Vector => Ok(crate::Expression::Vector(stx.children.iter()
+                    .map(|stx| self.quote_syntax(stx, qq_depth)).collect::<Result<Vec<_>, _>>()?)),
+                Datum::Quote => Ok(crate::Expression::Quotation(Box::new(self.quote_syntax(stx.children.first().unwrap(), usize::MAX)?))),
+                Datum::Quasiquote => Ok(crate::Expression::Quasiquotation(Box::new(self.quote_syntax(stx.children.first().unwrap(), qq_depth + 1)?))),
+                Datum::Unquote => Ok(crate::Expression::Unquotation(Box::new(self.quote_syntax(stx.children.first().unwrap(), qq_depth - 1)?))),
+                Datum::UnquoteSplicing => Ok(crate::Expression::SplicingUnquotation(Box::new(self.quote_syntax(stx.children.first().unwrap(), qq_depth - 1)?))),
+            }
+        }
+    }
+    fn resolve_syntax(&self, stx: &Rc<SyntaxObject>) -> Result<crate::Expression, Error> {
+        match &stx.e {
+            Datum::Boolean(b) => Ok(crate::Expression::Boolean(*b)),
+            Datum::Integer(i) => Ok(crate::Expression::Integer(*i)),
+            Datum::Rational(n, d) => Ok(crate::Expression::Rational(*n, *d)),
+            Datum::Float(f) => Ok(crate::Expression::Float(*f)),
+            Datum::Character(c) => Ok(crate::Expression::Character(*c)),
+            Datum::String(s) => Ok(crate::Expression::String(s.clone())),
+            Datum::Bytes(items) => Ok(crate::Expression::Bytes(items.clone())),
+            Datum::Vector => Ok(crate::Expression::Vector(stx.children.iter()
+                .map(|stx| self.resolve_syntax(stx)).collect::<Result<Vec<_>, _>>()?)),
+            Datum::Quote => Ok(crate::Expression::Quotation(Box::new(self.quote_syntax(stx.children.first().unwrap(), usize::MAX)?))),
+            Datum::Quasiquote => Ok(crate::Expression::Quasiquotation(Box::new(self.quote_syntax(stx.children.first().unwrap(), 1)?))),
+            Datum::Unquote | Datum::UnquoteSplicing => Err(Error::BadSyntax(stx.clone())),
+            Datum::Symbol(_) => match self.resolve(&stx)? {
+                Some(Binding::CorePrimitive(name)) => Ok(crate::Expression::CorePrimitive(name)),
+                Some(Binding::Variable(i)) => Ok(crate::Expression::Variable(i)),
+                Some(_) => Err(Error::BadSyntax(stx.clone())),
+                None => Err(Error::UnboundIdentifier(stx.clone())),
+            },
+            Datum::ImproperList => match stx.children.first() {
+                None => Ok(crate::Expression::Nil),
+                Some(head) => {
+                    let operator = match self.resolve_syntax(head) {
+                        Ok(expr) => Box::new(expr),
+                        Err(Error::BadSyntax(_)) => return Err(Error::BadSyntax(stx.clone())),
+                        Err(e) => return Err(e),
+                    };
+                    let mut operands = stx.children.iter().skip(1)
+                        .map(|stx| self.resolve_syntax(stx))
+                        .collect::<Result<Vec<_>, _>>()?;
+                    let tail = operands.pop().map(Box::new);
+                    Ok(crate::Expression::ProcedureCall { operator, operands: (operands, tail) })
+                },
+            },
+            Datum::List => match stx.children.first() {
+                None => Ok(crate::Expression::Nil),
+                Some(head) => match self.resolve(head)? {
+                    None => match &head.e {
+                        Datum::Symbol(_) => Err(Error::UnboundIdentifier(head.clone())),
+                        _ => Ok(crate::Expression::ProcedureCall {
+                            operator: match self.resolve_syntax(head) {
+                                Ok(expr) => Box::new(expr),
+                                Err(Error::BadSyntax(_)) => return Err(Error::BadSyntax(stx.clone())),
+                                Err(e) => return Err(e),
+                            },
+                            operands: (stx.children.iter().skip(1)
+                                .map(|stx| self.resolve_syntax(stx))
+                                .collect::<Result<Vec<_>, _>>()?, None),
+                        }),
+                    },
+                    Some(Binding::ExpandOnlyCoreForm | Binding::SyntaxTransformer(_)) => Err(Error::BadSyntax(stx.clone())),
+                    Some(Binding::CorePrimitive(s)) => Ok(crate::Expression::ProcedureCall {
+                        operator: Box::new(crate::Expression::CorePrimitive(s)),
+                        operands: (stx.children.iter().skip(1)
+                            .map(|stx| self.resolve_syntax(stx))
+                            .collect::<Result<Vec<_>, _>>()?, None) }),
+                    Some(Binding::Variable(i)) => Ok(crate::Expression::ProcedureCall {
+                        operator: Box::new(crate::Expression::Variable(i)),
+                        operands: (stx.children.iter().skip(1)
+                            .map(|stx| self.resolve_syntax(stx))
+                            .collect::<Result<Vec<_>, _>>()?, None) }),
+                    Some(Binding::CoreForm(CoreForm::Lambda)) => Ok(crate::Expression::Lambda {
+                        formals: match stx.children.get(1) {
+                            None => return Err(Error::BadCoreFormSyntax(CoreForm::Lambda, stx.clone())),
+                            Some(stx) => match &stx.e {
+                                Datum::Symbol(_) => match self.resolve(stx)? {
+                                    Some(Binding::Variable(i)) => (Vec::new(), Some(Box::new(crate::Expression::Variable(i)))),
+                                    Some(_) => return Err(Error::BadCoreFormSyntax(CoreForm::Lambda, stx.clone())),
+                                    None => return Err(Error::UnboundIdentifier(stx.clone())),
+                                },
+                                Datum::List => (stx.children.iter()
+                                    .map(|stx| match self.resolve(stx)? {
+                                        Some(Binding::Variable(i)) => Ok(crate::Expression::Variable(i)),
+                                        Some(_) => Err(Error::BadCoreFormSyntax(CoreForm::Lambda, stx.clone())),
+                                        None => Err(Error::UnboundIdentifier(stx.clone())),
+                                    })
+                                    .collect::<Result<Vec<_>, _>>()?, None),
+                                Datum::ImproperList => {
+                                    let mut formals = stx.children.iter()
+                                        .map(|stx| match self.resolve(stx)? {
+                                            Some(Binding::Variable(i)) => Ok(crate::Expression::Variable(i)),
+                                            Some(_) => Err(Error::BadCoreFormSyntax(CoreForm::Lambda, stx.clone())),
+                                            None => Err(Error::UnboundIdentifier(stx.clone())),
+                                        })
+                                        .collect::<Result<Vec<_>, _>>()?;
+                                    let tail = formals.pop().map(Box::new);
+                                    (formals, tail)
+                                },
+                                _ => return Err(Error::BadCoreFormSyntax(CoreForm::Lambda, stx.clone())),
+                            }
+                        },
+                        body: stx.children.iter().skip(2)
+                            .map(|stx| self.resolve_syntax(stx))
+                            .collect::<Result<Vec<_>, _>>()? }),
+                    Some(Binding::CoreForm(CoreForm::If)) => Ok(crate::Expression::Conditional {
+                        test: match stx.children.get(1) {
+                            None => return Err(Error::BadCoreFormSyntax(CoreForm::If, stx.clone())),
+                            Some(stx) => Box::new(self.resolve_syntax(stx)?),
+                        },
+                        consequent: match stx.children.get(2) {
+                            None => return Err(Error::BadCoreFormSyntax(CoreForm::If, stx.clone())),
+                            Some(stx) => Box::new(self.resolve_syntax(stx)?),
+                        },
+                        alternate: match stx.children.get(3) {
+                            None => None,
+                            Some(stx) => Some(Box::new(self.resolve_syntax(stx)?)),
+                        }}),
+                    Some(Binding::CoreForm(CoreForm::Begin)) => Ok(crate::Expression::Block(stx.children.iter()
+                        .skip(1)
+                        .map(|stx| self.resolve_syntax(stx))
+                        .collect::<Result<Vec<_>, _>>()?)),
+                    Some(Binding::CoreForm(CoreForm::SetBang)) => Ok(crate::Expression::Assignment {
+                        id: match stx.children.get(1).map(|c| &c.e) {
+                            Some(Datum::Symbol(_)) => match self.resolve(&stx.children[1])? {
+                                Some(Binding::Variable(i)) => Box::new(crate::Expression::Variable(i)),
+                                Some(_) => return Err(Error::BadCoreFormSyntax(CoreForm::SetBang, stx.children[1].clone())),
+                                None => return Err(Error::UnboundIdentifier(stx.children[1].clone())),
+                            },
+                            Some(_) => return Err(Error::BadCoreFormSyntax(CoreForm::SetBang, stx.children[1].clone())),
+                            None => return Err(Error::BadCoreFormSyntax(CoreForm::SetBang, stx.clone())),
+                        },
+                        value: Box::new(stx.children.get(2)
+                            .map(|stx| self.resolve_syntax(stx))
+                            .ok_or_else(|| Error::BadCoreFormSyntax(CoreForm::SetBang, stx.clone()))??),
+                    }),
+                    Some(Binding::CoreForm(CoreForm::Quote)) => match stx.children.get(1) {
+                        None => return Err(Error::BadCoreFormSyntax(CoreForm::Quote, stx.clone())),
+                        Some(stx) => Ok(crate::Expression::Quotation(Box::new(self.quote_syntax(stx, usize::MAX)?))),
+                    },
+                    Some(Binding::CoreForm(CoreForm::Quasiquote)) => match stx.children.get(1) {
+                        None => return Err(Error::BadCoreFormSyntax(CoreForm::Quasiquote, stx.clone())),
+                        Some(stx) => Ok(crate::Expression::Quasiquotation(Box::new(self.quote_syntax(stx, 1)?))),
+                    },
+                    Some(Binding::CoreForm(CoreForm::Unquote | CoreForm::UnquoteSplicing)) => Err(Error::BadSyntax(stx.clone())),
+                    Some(Binding::CoreForm(CoreForm::DefineValues)) => Ok(crate::Expression::Definition {
+                        formals: match stx.children.get(1) {
+                            None => return Err(Error::BadCoreFormSyntax(CoreForm::DefineValues, stx.clone())),
+                            Some(stx) => match &stx.e {
+                                Datum::Symbol(_) => match self.resolve(stx)? {
+                                    Some(Binding::Variable(i)) => (Vec::new(), Some(Box::new(crate::Expression::Variable(i)))),
+                                    Some(_) => return Err(Error::BadCoreFormSyntax(CoreForm::DefineValues, stx.clone())),
+                                    None => return Err(Error::UnboundIdentifier(stx.clone())),
+                                },
+                                Datum::List => (stx.children.iter()
+                                    .map(|stx| match self.resolve(stx)? {
+                                        Some(Binding::Variable(i)) => Ok(crate::Expression::Variable(i)),
+                                        Some(_) => Err(Error::BadCoreFormSyntax(CoreForm::DefineValues, stx.clone())),
+                                        None => Err(Error::UnboundIdentifier(stx.clone())),
+                                    })
+                                    .collect::<Result<Vec<_>, _>>()?, None),
+                                Datum::ImproperList => {
+                                    let mut formals = stx.children.iter()
+                                        .map(|stx| match self.resolve(stx)? {
+                                            Some(Binding::Variable(i)) => Ok(crate::Expression::Variable(i)),
+                                            Some(_) => Err(Error::BadCoreFormSyntax(CoreForm::DefineValues, stx.clone())),
+                                            None => Err(Error::UnboundIdentifier(stx.clone())),
+                                        })
+                                        .collect::<Result<Vec<_>, _>>()?;
+                                    let tail = formals.pop().map(Box::new);
+                                    (formals, tail)
+                                },
+                                _ => return Err(Error::BadCoreFormSyntax(CoreForm::DefineValues, stx.clone())),
+                            }
+                        },
+                        body: stx.children.iter().skip(2)
+                            .map(|stx| self.resolve_syntax(stx))
+                            .collect::<Result<Vec<_>, _>>()? }),
+                    Some(Binding::CoreForm(CoreForm::_MaxValue)) => panic!(),
+                },
+            },
+        }
     }
 }
 
@@ -1668,5 +1991,5 @@ pub fn expand(stx: SyntaxObject, env: &mut Environment) -> Result<crate::Express
     let stx = env.define_inner(stx)?;
     let stx = env.expand_and_scope(stx)?;
     eprintln!("step3: {}", stx);
-    env.resolve_syntax(stx)
+    env.resolve_syntax(&stx)
 }
