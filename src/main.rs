@@ -3,10 +3,18 @@ mod syntax;
 
 #[derive(Debug, Clone)]
 pub enum Expression {
-    // Identifiers
     CorePrimitive(&'static str),
     Variable(usize),
-    // Literals
+    Literal(Literal),
+    ProcedureCall { operator: Box<Expression>, operands: (Vec<Expression>, Option<Box<Expression>>) },
+    Lambda { formals: (Vec<Expression>, Option<Box<Expression>>), body: Vec<Expression> },
+    Conditional { test: Box<Expression>, consequent: Box<Expression>, alternate: Option<Box<Expression>> },
+    Assignment { id: Box<Expression>, value: Box<Expression> },
+    Definition { formals: (Vec<Expression>, Option<Box<Expression>>), body: Vec<Expression> },
+    Block { body: Vec<Expression> },
+}
+#[derive(Debug, Clone)]
+pub enum Literal {
     Nil,
     Boolean(bool),
     Integer(i64),
@@ -14,21 +22,11 @@ pub enum Expression {
     Float(f64),
     Character(char),
     String(String),
-    Symbol(String),
     Bytes(Vec<u8>),
-    Vector(Vec<Expression>),
-    ListDatum(Vec<Expression>, Option<Box<Expression>>), // only permitted in quoted forms
-    // Complex
-    Block(Vec<Expression>),
-    ProcedureCall { operator: Box<Expression>, operands: (Vec<Expression>, Option<Box<Expression>>) },
-    Lambda { formals: (Vec<Expression>, Option<Box<Expression>>), body: Vec<Expression> },
-    Conditional { test: Box<Expression>, consequent: Box<Expression>, alternate: Option<Box<Expression>> },
-    Assignment { id: Box<Expression>, value: Box<Expression> },
-    Definition { formals: (Vec<Expression>, Option<Box<Expression>>), body: Vec<Expression> },
-    Quotation(Box<Expression>),
-    Quasiquotation(Box<Expression>),
-    Unquotation(Box<Expression>),
-    SplicingUnquotation(Box<Expression>),
+    Symbol(String),
+    StaticSymbol(&'static str),
+    List(Vec<Literal>, Option<Box<Literal>>),
+    Vector(Vec<Literal>),
 }
 
 fn main() {

@@ -1,3 +1,4 @@
+use crate::{Expression, Literal};
 use crate::io::InputPort;
 use std::cell::{Cell, LazyCell};
 use std::rc::Rc;
@@ -171,6 +172,13 @@ enum Template {
     Vector(Vec<Template>),
 }
 
+#[derive(Debug, Clone)]
+enum QQExpansion {
+    Literal(Literal),
+    Unquote(Expression),
+    UnquoteSplicing(Expression),
+}
+
 static SYNTAX_DEFINITION_PATTERN: std::sync::LazyLock<Pattern> = std::sync::LazyLock::new(|| Pattern::List(vec![
     Pattern::Literal("define-syntax".into()),
     Pattern::Variable("name".into()),
@@ -210,9 +218,10 @@ static SYNTAX_BINDING_PATTERN: std::sync::LazyLock<Pattern> = std::sync::LazyLoc
         ]))),
     ]),
 ], Box::new(Pattern::Variable("body".into()))));
-static CORE_PRIMITIVES: std::sync::LazyLock<std::collections::HashSet<String>> = std::sync::LazyLock::new(|| [
+static CORE_PRIMITIVES: std::sync::LazyLock<std::collections::HashSet<&'static str>> = std::sync::LazyLock::new(|| [
     "*", "+", "-",
-].map(|f: &'static str| f.to_string()).into());
+    "list", "cons", "append",
+].into());
 
 thread_local! {
     static CORE_FORM_BEGIN_STX: LazyCell<Rc<SyntaxObject>> = const { LazyCell::new(|| Rc::new(SyntaxObject { e: Datum::Symbol("begin".into()), children: vec![], scopes: Default::default(), source_location: (0, 0)})) };
@@ -236,10 +245,10 @@ impl SyntaxObject {
             Datum::Symbol(_) | Datum::Quote => {
                 self.scopes.insert(scope);
             },
-            Datum::List | Datum::ImproperList | Datum::Vector | Datum::Quasiquote | Datum::Unquote | Datum::UnquoteSplicing => {
+            Datum::List | Datum::ImproperList | Datum::Quasiquote | Datum::Unquote | Datum::UnquoteSplicing => {
                 self.scopes.insert(scope);
                 self.children.iter_mut()
-                    .filter(|stx| matches!(stx.e, Datum::Symbol(_) | Datum::List | Datum::ImproperList | Datum::Vector | Datum::Quasiquote | Datum::Unquote | Datum::UnquoteSplicing))
+                    .filter(|stx| matches!(stx.e, Datum::Symbol(_) | Datum::List | Datum::ImproperList | Datum::Quasiquote | Datum::Unquote | Datum::UnquoteSplicing))
                     .for_each(|stx| Rc::make_mut(stx).add_scope(scope));
             },
             _ => (),
@@ -574,10 +583,16 @@ impl Template {
 
 impl Environment {
     pub fn new() -> Self {
-        let mut bindings = (0..(CoreForm::_MaxValue as u8))
-            .map(|cf| unsafe { std::mem::transmute(cf) })
-            .map(|cf: CoreForm| (cf.to_string(), std::iter::once((ScopeSet::new(), Binding::CoreForm(cf))).collect()))
-            .collect::<std::collections::HashMap<_, _>>();
+        let mut bindings = std::collections::HashMap::new();
+        bindings.insert(CoreForm::Lambda.to_string(), std::iter::once((ScopeSet::default(), Binding::CoreForm(CoreForm::Lambda))).collect());
+        bindings.insert(CoreForm::If.to_string(), std::iter::once((ScopeSet::default(), Binding::CoreForm(CoreForm::If))).collect());
+        bindings.insert(CoreForm::Begin.to_string(), std::iter::once((ScopeSet::default(), Binding::CoreForm(CoreForm::Begin))).collect());
+        bindings.insert(CoreForm::SetBang.to_string(), std::iter::once((ScopeSet::default(), Binding::CoreForm(CoreForm::SetBang))).collect());
+        bindings.insert(CoreForm::Quote.to_string(), std::iter::once((ScopeSet::default(), Binding::CoreForm(CoreForm::Quote))).collect());
+        bindings.insert(CoreForm::Quasiquote.to_string(), std::iter::once((ScopeSet::default(), Binding::CoreForm(CoreForm::Quasiquote))).collect());
+        bindings.insert(CoreForm::Unquote.to_string(), std::iter::once((ScopeSet::default(), Binding::CoreForm(CoreForm::Unquote))).collect());
+        bindings.insert(CoreForm::UnquoteSplicing.to_string(), std::iter::once((ScopeSet::default(), Binding::CoreForm(CoreForm::UnquoteSplicing))).collect());
+        bindings.insert(CoreForm::DefineValues.to_string(), std::iter::once((ScopeSet::default(), Binding::CoreForm(CoreForm::DefineValues))).collect());
         bindings.insert("define-syntax".into(), std::iter::once((ScopeSet::default(), Binding::ExpandOnlyCoreForm)).collect());
         bindings.insert("letrec-syntax".into(), std::iter::once((ScopeSet::default(), Binding::ExpandOnlyCoreForm)).collect());
 
@@ -677,9 +692,9 @@ impl Environment {
                     for v in vs {
                         if let MatchValue::One(stx) = v {
                             if let Datum::Symbol(name) = &stx.e {
-                                match CORE_PRIMITIVES.get(name) {
-                                    Some(s) => self.bindings.entry(name.clone()).or_default()
-                                        .insert(ScopeSet::default(), Binding::CorePrimitive(s.as_str())),
+                                match CORE_PRIMITIVES.get(name.as_str()) {
+                                    Some(&s) => self.bindings.entry(name.clone()).or_default()
+                                        .insert(ScopeSet::default(), Binding::CorePrimitive(s)),
                                     None => return Err(Error::AmbiguousBinding(name.clone())),
                                 };
                             }
@@ -977,58 +992,241 @@ impl Environment {
         }
     }
 
-    fn quote_syntax(&self, stx: &Rc<SyntaxObject>, qq_depth: usize) -> Result<crate::Expression, Error> {
-        if qq_depth == 0 {
-            self.resolve_syntax(stx)
-        } else {
-            match &stx.e {
-                Datum::Boolean(b) => Ok(crate::Expression::Boolean(*b)),
-                Datum::Integer(i) => Ok(crate::Expression::Integer(*i)),
-                Datum::Rational(n, d) => Ok(crate::Expression::Rational(*n, *d)),
-                Datum::Float(f) => Ok(crate::Expression::Float(*f)),
-                Datum::Character(c) => Ok(crate::Expression::Character(*c)),
-                Datum::String(s) => Ok(crate::Expression::String(s.clone())),
-                Datum::Symbol(s) => Ok(crate::Expression::Symbol(s.clone())),
-                Datum::Bytes(items) => Ok(crate::Expression::Bytes(items.clone())),
-                Datum::List => match stx.children.first() {
-                    Some(head) => match self.resolve(head)? {
-                        Some(Binding::CoreForm(CoreForm::Quote)) if stx.children.len() > 1 => Ok(crate::Expression::Quotation(Box::new(self.quote_syntax(&stx.children[1], usize::MAX)?))),
-                        Some(Binding::CoreForm(CoreForm::Quasiquote)) if stx.children.len() > 1 => Ok(crate::Expression::Quasiquotation(Box::new(self.quote_syntax(&stx.children[1], qq_depth + 1)?))),
-                        Some(Binding::CoreForm(CoreForm::Unquote)) if stx.children.len() > 1 => Ok(crate::Expression::Unquotation(Box::new(self.quote_syntax(&stx.children[1], qq_depth - 1)?))),
-                        Some(Binding::CoreForm(CoreForm::UnquoteSplicing)) if stx.children.len() > 1 => Ok(crate::Expression::SplicingUnquotation(Box::new(self.quote_syntax(&stx.children[1], qq_depth - 1)?))),
-                        _ => Ok(crate::Expression::ListDatum(stx.children.iter()
-                            .map(|stx| self.quote_syntax(stx, qq_depth)).collect::<Result<Vec<_>, _>>()?, None)),
+    fn qquote_syntax(&self, stx: &Rc<SyntaxObject>, depth: usize) -> Result<Expression, Error> {
+        match &stx.e {
+            Datum::Boolean(_) | Datum::Integer(_) | Datum::Rational(_, _) | Datum::Float(_) | Datum::Character(_) | Datum::String(_) | Datum::Symbol(_) | Datum::Bytes(_) | Datum::Quote | Datum::Vector => Ok(Expression::Literal(self.literal_syntax(stx))),
+            Datum::Quasiquote => Ok(Expression::ProcedureCall {
+                operator: Box::new(Expression::CorePrimitive("list")),
+                operands: (vec![Expression::Literal(Literal::StaticSymbol("quasiquote")),
+                    self.qquote_syntax(stx.children.first().unwrap(), depth + 1)?], None),
+            }),
+            Datum::Unquote => if depth == 1 {
+                self.resolve_syntax(stx.children.first().unwrap())
+            } else {
+                Ok(Expression::ProcedureCall {
+                    operator: Box::new(Expression::CorePrimitive("list")),
+                    operands: (vec![Expression::Literal(Literal::StaticSymbol("unquote")),
+                        self.qquote_syntax(stx.children.first().unwrap(), depth - 1)?], None),
+                })
+            },
+            Datum::UnquoteSplicing => if depth == 1 {
+                self.resolve_syntax(stx.children.first().unwrap())
+            } else {
+                Ok(Expression::ProcedureCall {
+                    operator: Box::new(Expression::CorePrimitive("list")),
+                    operands: (vec![Expression::Literal(Literal::StaticSymbol("unquote-splicing")),
+                        self.qquote_syntax(stx.children.first().unwrap(), depth - 1)?], None),
+                })
+            },
+            Datum::ImproperList => {
+                match self.qquote_syntax_list(stx, depth)? {
+                    Expression::Literal(Literal::List(mut ee, None)) => {
+                        let tail = ee.pop().map(Box::new);
+                        Ok(Expression::Literal(Literal::List(ee, tail)))
                     },
-                    None => Ok(crate::Expression::ListDatum(Vec::new(), None)),
-                },
-                Datum::ImproperList => {
-                    let mut children = stx.children.iter()
-                        .map(|stx| self.quote_syntax(stx, qq_depth)).collect::<Result<Vec<_>, _>>()?;
-                    let tail = children.pop().map(Box::new);
-                    Ok(crate::Expression::ListDatum(children, tail))
-                },
-                Datum::Vector => Ok(crate::Expression::Vector(stx.children.iter()
-                    .map(|stx| self.quote_syntax(stx, qq_depth)).collect::<Result<Vec<_>, _>>()?)),
-                Datum::Quote => Ok(crate::Expression::Quotation(Box::new(self.quote_syntax(stx.children.first().unwrap(), usize::MAX)?))),
-                Datum::Quasiquote => Ok(crate::Expression::Quasiquotation(Box::new(self.quote_syntax(stx.children.first().unwrap(), qq_depth + 1)?))),
-                Datum::Unquote => Ok(crate::Expression::Unquotation(Box::new(self.quote_syntax(stx.children.first().unwrap(), qq_depth - 1)?))),
-                Datum::UnquoteSplicing => Ok(crate::Expression::SplicingUnquotation(Box::new(self.quote_syntax(stx.children.first().unwrap(), qq_depth - 1)?))),
+                    Expression::ProcedureCall { operator, mut operands } => match *operator {
+                        Expression::CorePrimitive("list") => if let Some(tail) = operands.0.pop() {
+                            Ok(Expression::ProcedureCall {
+                                operator: Box::new(Expression::CorePrimitive("append")),
+                                operands: (vec![Expression::ProcedureCall {
+                                    operator: Box::new(Expression::CorePrimitive("list")),
+                                    operands,
+                                }, tail], None),
+                            })
+                        } else {
+                            Ok(Expression::ProcedureCall { operator, operands })
+                        },
+                        Expression::CorePrimitive("append") => match operands.0.last() {
+                            None => Ok(Expression::Literal(Literal::Nil)),
+                            Some(Expression::ProcedureCall { operator: sub_operator, .. }) if matches!(**sub_operator, Expression::CorePrimitive("list")) => if let Some(tail) = operands.0.pop() {
+                                Ok(Expression::ProcedureCall {
+                                    operator: Box::new(Expression::CorePrimitive("append")),
+                                    operands: (vec![Expression::ProcedureCall {
+                                        operator: Box::new(Expression::CorePrimitive("list")),
+                                        operands,
+                                    }, tail], None),
+                                })
+                            } else {
+                                Ok(Expression::ProcedureCall { operator, operands })
+                            },
+                            Some(_) => Err(Error::BadCoreFormSyntax(CoreForm::UnquoteSplicing, stx.clone())),
+                        },
+                        _ => unreachable!(),
+                    },
+                    _ => unreachable!(),
+                }
+                // e is either: Literal(List(vec, None)), so we just take the last atom out and stick it in the tail.
+                // or ProcedureCall(list, ...), so we just take the last one out and say (cons [orig] [tail])
+                // or ProcedureCall(append, ...), so we find the last child (which will be a list) and do ^^
+            },
+            Datum::List => match stx.children.first() {
+                None => Ok(Expression::Literal(Literal::Nil)),
+                Some(head) => match self.resolve(head)? {
+                    Some(Binding::CoreForm(CoreForm::Quote)) => match stx.children.get(1) {
+                        None => Err(Error::BadCoreFormSyntax(CoreForm::Quote, stx.clone())),
+                        Some(stx) => Ok(Expression::Literal(self.literal_syntax(stx))),
+                    },
+                    Some(Binding::CoreForm(CoreForm::Quasiquote)) => match stx.children.get(1) {
+                        None => Err(Error::BadCoreFormSyntax(CoreForm::Quasiquote, stx.clone())),
+                        Some(stx) => Ok(Expression::ProcedureCall {
+                            operator: Box::new(Expression::CorePrimitive("list")),
+                            operands: (vec![Expression::Literal(Literal::StaticSymbol("quasiquote")),
+                                self.qquote_syntax(stx.children.first().unwrap(), depth + 1)?], None),
+                        }),
+                    },
+                    Some(Binding::CoreForm(CoreForm::Unquote)) => match stx.children.get(1) {
+                        None => Err(Error::BadCoreFormSyntax(CoreForm::Unquote, stx.clone())),
+                        Some(stx) => if depth == 1 {
+                            self.resolve_syntax(stx)
+                        } else {
+                            Ok(Expression::ProcedureCall {
+                                operator: Box::new(Expression::CorePrimitive("list")),
+                                operands: (vec![Expression::Literal(Literal::StaticSymbol("unquote")),
+                                    self.qquote_syntax(stx, depth - 1)?], None),
+                            })
+                        },
+                    },
+                    Some(Binding::CoreForm(CoreForm::UnquoteSplicing)) => match stx.children.get(1) {
+                        None => Err(Error::BadCoreFormSyntax(CoreForm::UnquoteSplicing, stx.clone())),
+                        Some(stx) => if depth == 1 {
+                            self.resolve_syntax(stx)
+                        } else {
+                            Ok(Expression::ProcedureCall {
+                                operator: Box::new(Expression::CorePrimitive("list")),
+                                operands: (vec![Expression::Literal(Literal::StaticSymbol("unquote-splicing")),
+                                    self.qquote_syntax(stx, depth - 1)?], None),
+                            })
+                        },
+                    },
+                    _ => self.qquote_syntax_list(stx, depth),
+                }
             }
         }
     }
-    fn resolve_syntax(&self, stx: &Rc<SyntaxObject>) -> Result<crate::Expression, Error> {
+    fn qquote_syntax_list(&self, stx: &Rc<SyntaxObject>, depth: usize) -> Result<Expression, Error> {
+        let mut qqs = false;
+        let mut append_items = Vec::new();
+        for stx in &stx.children {
+            let mut q = None;
+            if matches!(stx.e, Datum::List) && stx.children.len() > 1 {
+                if let Datum::Symbol(name) = &stx.children.first().unwrap().e {
+                    q = match name.as_str() {
+                        "unquote" => Some(QQExpansion::Unquote(self.qquote_syntax(&stx.children[1], depth - 1)?)),
+                        "unquote-splicing" => Some(QQExpansion::UnquoteSplicing(self.qquote_syntax(&stx.children[1], depth - 1)?)),
+                        _ => None,
+                    };
+                }
+            }
+            if q.is_none() {
+                q = Some(match (&stx.e, self.qquote_syntax(&stx, depth)?) {
+                    (Datum::Unquote, e) => QQExpansion::Unquote(e),
+                    (Datum::UnquoteSplicing, e) => QQExpansion::UnquoteSplicing(e),
+                    (_, Expression::Literal(e)) => QQExpansion::Literal(e),
+                    (_, e) => QQExpansion::Unquote(e),
+                });
+            }
+
+            qqs = match (qqs, q.unwrap()) {
+                (false, QQExpansion::Literal(e)) => {
+                    append_items.push(Expression::ProcedureCall {
+                        operator: Box::new(Expression::CorePrimitive("list")),
+                        operands: (vec![Expression::Literal(e)], None)
+                    });
+                    true
+                },
+                (false, QQExpansion::Unquote(e)) => {
+                    append_items.push(Expression::ProcedureCall {
+                        operator: Box::new(Expression::CorePrimitive("list")),
+                        operands: (vec![e], None)
+                    });
+                    true
+                },
+                (true, QQExpansion::Literal(e)) => {
+                    if let Expression::ProcedureCall { operands, .. } = append_items.last_mut().unwrap() {
+                        operands.0.push(Expression::Literal(e));
+                        true
+                    } else {
+                        unreachable!()
+                    }
+                },
+                (true, QQExpansion::Unquote(e)) => {
+                    if let Expression::ProcedureCall { operands, .. } = append_items.last_mut().unwrap() {
+                        operands.0.push(e);
+                        true
+                    } else {
+                        unreachable!()
+                    }
+                },
+                (_, QQExpansion::UnquoteSplicing(e)) => {
+                    append_items.push(e);
+                    false
+                }
+            };
+        }
+
+        if append_items.len() > 1 {
+            Ok(Expression::ProcedureCall {
+                operator: Box::new(Expression::CorePrimitive("append")),
+                operands: (append_items, None)
+            })
+        } else {
+            match append_items.pop() {
+                None => Ok(Expression::Literal(Literal::Nil)),
+                Some(Expression::ProcedureCall { operands: (literals, None), .. }) if literals.iter().all(|q| matches!(q, Expression::Literal(_))) => {
+                    Ok(Expression::Literal(Literal::List(literals.into_iter().map(|q| match q {
+                        Expression::Literal(e) => e,
+                        _ => unreachable!(),
+                    }).collect(), None)))
+                },
+                Some(e) => Ok(e),
+            }
+        }
+    }
+    fn literal_syntax(&self, stx: &Rc<SyntaxObject>) -> Literal {
+        eprintln!("literal_syntax({})", stx);
         match &stx.e {
-            Datum::Boolean(b) => Ok(crate::Expression::Boolean(*b)),
-            Datum::Integer(i) => Ok(crate::Expression::Integer(*i)),
-            Datum::Rational(n, d) => Ok(crate::Expression::Rational(*n, *d)),
-            Datum::Float(f) => Ok(crate::Expression::Float(*f)),
-            Datum::Character(c) => Ok(crate::Expression::Character(*c)),
-            Datum::String(s) => Ok(crate::Expression::String(s.clone())),
-            Datum::Bytes(items) => Ok(crate::Expression::Bytes(items.clone())),
-            Datum::Vector => Ok(crate::Expression::Vector(stx.children.iter()
-                .map(|stx| self.resolve_syntax(stx)).collect::<Result<Vec<_>, _>>()?)),
-            Datum::Quote => Ok(crate::Expression::Quotation(Box::new(self.quote_syntax(stx.children.first().unwrap(), usize::MAX)?))),
-            Datum::Quasiquote => Ok(crate::Expression::Quasiquotation(Box::new(self.quote_syntax(stx.children.first().unwrap(), 1)?))),
+            Datum::Boolean(b) => Literal::Boolean(*b),
+            Datum::Integer(i) => Literal::Integer(*i),
+            Datum::Rational(n, d) => Literal::Rational(*n, *d),
+            Datum::Float(f) => Literal::Float(*f),
+            Datum::Character(c) => Literal::Character(*c),
+            Datum::String(s) => Literal::String(s.clone()),
+            Datum::Bytes(items) => Literal::Bytes(items.clone()),
+            Datum::Symbol(s) => Literal::Symbol(s.clone()),
+            Datum::List => {
+                if stx.children.len() == 0 {
+                    return Literal::Nil;
+                }
+                if let Datum::Symbol(name) = &stx.children.first().unwrap().e {
+                    if stx.children.len() > 1 {
+                        match name.as_str() {
+                            "quote" => return Literal::List(vec![Literal::StaticSymbol("quote"), self.literal_syntax(&stx.children[1])], None),
+                            "quasiquote" => return Literal::List(vec![Literal::StaticSymbol("quasiquote"), self.literal_syntax(&stx.children[1])], None),
+                            "unquote" => return Literal::List(vec![Literal::StaticSymbol("unquote"), self.literal_syntax(&stx.children[1])], None),
+                            "unquote-splicing" => return Literal::List(vec![Literal::StaticSymbol("unquote-splicing"), self.literal_syntax(&stx.children[1])], None),
+                            _ => (),
+                        }
+                    }
+                }
+                Literal::List(stx.children.iter().map(|stx| self.literal_syntax(stx)).collect(), None)
+            },
+            Datum::ImproperList => {
+                let mut children = stx.children.iter().map(|stx| self.literal_syntax(stx)).collect::<Vec<_>>();
+                let tail = children.pop().map(Box::new);
+                Literal::List(children, tail)
+            },
+            Datum::Vector => Literal::Vector(stx.children.iter().map(|stx| self.literal_syntax(stx)).collect()),
+            Datum::Quote => Literal::List(vec![Literal::StaticSymbol("quote"), self.literal_syntax(stx.children.first().unwrap())], None),
+            Datum::Quasiquote => Literal::List(vec![Literal::StaticSymbol("quasiquote"), self.literal_syntax(stx.children.first().unwrap())], None),
+            Datum::Unquote => Literal::List(vec![Literal::StaticSymbol("unquote"), self.literal_syntax(stx.children.first().unwrap())], None),
+            Datum::UnquoteSplicing => Literal::List(vec![Literal::StaticSymbol("unquote-splicing"), self.literal_syntax(stx.children.first().unwrap())], None),
+        }
+    }
+    fn resolve_syntax(&self, stx: &Rc<SyntaxObject>) -> Result<Expression, Error> {
+        match &stx.e {
+            Datum::Boolean(_) | Datum::Integer(_) | Datum::Rational(_, _) | Datum::Float(_) | Datum::Character(_) | Datum::String(_) | Datum::Bytes(_) | Datum::Vector => Ok(Expression::Literal(self.literal_syntax(stx))),
+            Datum::Quote => Ok(Expression::Literal(self.literal_syntax(stx.children.first().unwrap()))),
+            Datum::Quasiquote => self.qquote_syntax(stx.children.first().unwrap(), 1),
             Datum::Unquote | Datum::UnquoteSplicing => Err(Error::BadSyntax(stx.clone())),
             Datum::Symbol(_) => match self.resolve(&stx)? {
                 Some(Binding::CorePrimitive(name)) => Ok(crate::Expression::CorePrimitive(name)),
@@ -1037,7 +1235,7 @@ impl Environment {
                 None => Err(Error::UnboundIdentifier(stx.clone())),
             },
             Datum::ImproperList => match stx.children.first() {
-                None => Ok(crate::Expression::Nil),
+                None => Ok(Expression::Literal(Literal::Nil)),
                 Some(head) => {
                     let operator = match self.resolve_syntax(head) {
                         Ok(expr) => Box::new(expr),
@@ -1052,7 +1250,7 @@ impl Environment {
                 },
             },
             Datum::List => match stx.children.first() {
-                None => Ok(crate::Expression::Nil),
+                None => Ok(Expression::Literal(Literal::Nil)),
                 Some(head) => match self.resolve(head)? {
                     None => match &head.e {
                         Datum::Symbol(_) => Err(Error::UnboundIdentifier(head.clone())),
@@ -1124,10 +1322,11 @@ impl Environment {
                             None => None,
                             Some(stx) => Some(Box::new(self.resolve_syntax(stx)?)),
                         }}),
-                    Some(Binding::CoreForm(CoreForm::Begin)) => Ok(crate::Expression::Block(stx.children.iter()
-                        .skip(1)
-                        .map(|stx| self.resolve_syntax(stx))
-                        .collect::<Result<Vec<_>, _>>()?)),
+                    Some(Binding::CoreForm(CoreForm::Begin)) => Ok(crate::Expression::Block {
+                        body: stx.children.iter()
+                            .skip(1)
+                            .map(|stx| self.resolve_syntax(stx))
+                            .collect::<Result<Vec<_>, _>>()? }),
                     Some(Binding::CoreForm(CoreForm::SetBang)) => Ok(crate::Expression::Assignment {
                         id: match stx.children.get(1).map(|c| &c.e) {
                             Some(Datum::Symbol(_)) => match self.resolve(&stx.children[1])? {
@@ -1144,11 +1343,11 @@ impl Environment {
                     }),
                     Some(Binding::CoreForm(CoreForm::Quote)) => match stx.children.get(1) {
                         None => return Err(Error::BadCoreFormSyntax(CoreForm::Quote, stx.clone())),
-                        Some(stx) => Ok(crate::Expression::Quotation(Box::new(self.quote_syntax(stx, usize::MAX)?))),
+                        Some(stx) => Ok(Expression::Literal(self.literal_syntax(stx))),
                     },
                     Some(Binding::CoreForm(CoreForm::Quasiquote)) => match stx.children.get(1) {
                         None => return Err(Error::BadCoreFormSyntax(CoreForm::Quasiquote, stx.clone())),
-                        Some(stx) => Ok(crate::Expression::Quasiquotation(Box::new(self.quote_syntax(stx, 1)?))),
+                        Some(stx) => self.qquote_syntax(stx, 1),
                     },
                     Some(Binding::CoreForm(CoreForm::Unquote | CoreForm::UnquoteSplicing)) => Err(Error::BadSyntax(stx.clone())),
                     Some(Binding::CoreForm(CoreForm::DefineValues)) => Ok(crate::Expression::Definition {
