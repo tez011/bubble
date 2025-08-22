@@ -1,38 +1,19 @@
 mod io;
 mod syntax;
+use std::cell::Cell;
 
-#[derive(Debug, Clone)]
-pub enum Expression {
-    CorePrimitive(&'static str),
-    Variable(usize),
-    Literal(Literal),
-    ProcedureCall { operator: Box<Expression>, operands: (Vec<Expression>, Option<Box<Expression>>) },
-    Lambda { formals: (Vec<Expression>, Option<Box<Expression>>), body: Vec<Expression> },
-    Conditional { test: Box<Expression>, consequent: Box<Expression>, alternate: Option<Box<Expression>> },
-    Assignment { id: Box<Expression>, value: Box<Expression> },
-    Definition { formals: (Vec<Expression>, Option<Box<Expression>>), body: Vec<Expression> },
-    Block { body: Vec<Expression> },
-}
-#[derive(Debug, Clone)]
-pub enum Literal {
-    Nil,
-    Boolean(bool),
-    Integer(i64),
-    Rational(i64, i64),
-    Float(f64),
-    Character(char),
-    String(String),
-    Bytes(Vec<u8>),
-    Symbol(String),
-    StaticSymbol(&'static str),
-    List(Vec<Literal>, Option<Box<Literal>>),
-    Vector(Vec<Literal>),
+#[derive(Debug)]
+pub struct Environment {
+    macros: std::collections::VecDeque<syntax::Rules>,
+    bindings: std::collections::HashMap<String, std::collections::BTreeMap<syntax::ScopeSet, syntax::Binding>>,
+    scope_counter: Cell<usize>,
+    bound_id_counter: Cell<usize>,
 }
 
 fn main() {
     let mut stdin = std::io::stdin().lock();
     let mut handle = io::InputPort::try_from(&mut stdin as &mut dyn std::io::Read).unwrap();
-    let mut e_env = syntax::Environment::new();
+    let mut e_env = Environment::new();
     loop {
         let stx = match syntax::read(&mut handle) {
             Ok(stx) => stx,
