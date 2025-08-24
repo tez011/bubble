@@ -1,3 +1,4 @@
+mod cps;
 mod io;
 mod syntax;
 use std::cell::Cell;
@@ -26,6 +27,9 @@ fn main() {
                 continue;
             }
         };
+
+        let k_dummy = cps::ContinuationID(usize::MAX);
+        let se = cps::transform(se, k_dummy, k_dummy, &e_env);
         println!("final form: {:#?}", se);
     }
 }
