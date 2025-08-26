@@ -16,7 +16,7 @@ impl<'a, 'b> TryFrom<&'a mut dyn std::io::Read> for InputPort<'a, 'b> {
             buffer: std::borrow::Cow::Owned(buffer),
             head: 0,
             tail,
-            source: (0, 0),
+            source: (1, 0),
         })
     }
 }
