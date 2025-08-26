@@ -5,7 +5,7 @@ use std::cell::Cell;
 #[derive(Debug)]
 pub struct Environment {
     macros: std::collections::VecDeque<syntax::Rules>,
-    bindings: std::collections::HashMap<String, std::collections::BTreeMap<syntax::ScopeSet, syntax::Binding>>,
+    bindings: std::collections::HashMap<std::borrow::Cow<'static, str>, std::collections::BTreeMap<syntax::ScopeSet, syntax::Binding>>,
     scope_counter: Cell<usize>,
     bound_id_counter: Cell<usize>,
 }

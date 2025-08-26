@@ -1,5 +1,6 @@
 use crate::Environment;
 use crate::io::InputPort;
+use std::borrow::Cow;
 use std::cell::{Cell, LazyCell};
 use std::rc::Rc;
 
@@ -32,7 +33,7 @@ impl From<Literal> for Expression { fn from(x: Literal) -> Self { Self::Literal(
 impl From<LiteralC> for Expression { fn from(x: LiteralC) -> Self { Self::Literal(Literal::Copy(x)) } }
 impl From<LiteralD> for Expression { fn from(x: LiteralD) -> Self { Self::Literal(Literal::Clone(x)) } }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Literal {
     Copy(LiteralC),
     Clone(LiteralD),
@@ -50,8 +51,23 @@ pub enum LiteralC {
     Character(char),
     Symbol(&'static str),
 }
+impl PartialEq for LiteralC {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::Boolean(l0), Self::Boolean(r0)) => l0 == r0,
+            (Self::Integer(l0), Self::Integer(r0)) => l0 == r0,
+            (Self::Rational(l0, l1), Self::Rational(r0, r1)) => l0 == r0 && l1 == r1,
+            (Self::Float(l0), Self::Float(r0)) => l0 == r0,
+            (Self::Character(l0), Self::Character(r0)) => l0 == r0,
+            (Self::Symbol(l0), Self::Symbol(r0)) => l0 == r0,
+            _ => false,
+        }
+    }
+}
+impl Eq for LiteralC {
+}
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum LiteralD {
     String(String),
     Bytes(Vec<u8>),
@@ -60,7 +76,7 @@ pub enum LiteralD {
     Vector(Vec<Literal>),
 }
 
-#[repr(u8)] #[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy)]
 pub enum CoreForm {
     Lambda,
     If,
@@ -71,21 +87,19 @@ pub enum CoreForm {
     Unquote,
     UnquoteSplicing,
     DefineValues,
-    _MaxValue,
 }
-impl std::fmt::Display for CoreForm {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl CoreForm {
+    pub fn as_str(self) -> &'static str {
         match self {
-            CoreForm::Lambda => write!(f, "lambda"),
-            CoreForm::If => write!(f, "if"),
-            CoreForm::Begin => write!(f, "begin"),
-            CoreForm::SetBang => write!(f, "set!"),
-            CoreForm::Quote => write!(f, "quote"),
-            CoreForm::Quasiquote => write!(f, "quasiquote"),
-            CoreForm::Unquote => write!(f, "unquote"),
-            CoreForm::UnquoteSplicing => write!(f, "unquote-splicing"),
-            CoreForm::DefineValues => write!(f, "define-values"),
-            CoreForm::_MaxValue => panic!(),
+            CoreForm::Lambda => "lambda",
+            CoreForm::If => "if",
+            CoreForm::Begin => "begin",
+            CoreForm::SetBang => "set!",
+            CoreForm::Quote => "quote",
+            CoreForm::Quasiquote => "quasiquote",
+            CoreForm::Unquote => "unquote",
+            CoreForm::UnquoteSplicing => "unquote-splicing",
+            CoreForm::DefineValues => "define-values",
         }
     }
 }
@@ -93,7 +107,6 @@ impl std::fmt::Display for CoreForm {
 #[derive(Debug, Clone, Copy)]
 pub enum Binding {
     CoreForm(CoreForm),
-    ExpandOnlyCoreForm,
     CorePrimitive(&'static str),
     SyntaxTransformer(usize),
     Variable(usize),
@@ -104,19 +117,19 @@ pub type Rules = Vec<(Pattern, Template)>;
 #[derive(Debug, Clone)]
 pub enum Pattern {
     Underscore,
-    Literal(String),
-    Variable(String),
+    Literal(Cow<'static, str>),
+    Variable(Cow<'static, str>),
     List(Vec<Pattern>),
     ImproperList(Vec<Pattern>, Box<Pattern>),
     Vector(Vec<Pattern>),
     Ellipsis(Box<Pattern>),
-    Constant(Datum),
+    Constant(Literal),
 }
 
 #[derive(Debug, Clone)]
 pub enum Template {
     Constant(Rc<SyntaxObject>),
-    Identifier(String),
+    Identifier(Cow<'static, str>),
     Ellipsis(Box<Template>),
     List(Vec<Template>),
     ImproperList(Vec<Template>, Box<Template>),
@@ -133,7 +146,7 @@ pub enum Error {
 
     BadSyntax(Rc<SyntaxObject>),
     BadCoreFormSyntax(CoreForm, Rc<SyntaxObject>),
-    AmbiguousBinding(String),
+    AmbiguousBinding(Cow<'static, str>),
     NoMatchingPattern(Rc<SyntaxObject>),
     UnboundIdentifier(Rc<SyntaxObject>),
 }
@@ -146,7 +159,7 @@ impl std::fmt::Display for Error {
             Error::InvalidNumber(msg) => write!(f, "Invalid number: {}", msg),
             Error::InvalidCharacter => write!(f, "Invalid character"),
             Error::BadSyntax(stx) => write!(f, "Bad syntax at {}:{}: {}", stx.source_location.0, stx.source_location.1, stx),
-            Error::BadCoreFormSyntax(c, stx) => write!(f, "Bad core-form syntax for {} at {}:{}: {}", c, stx.source_location.0, stx.source_location.1, stx),
+            Error::BadCoreFormSyntax(c, stx) => write!(f, "Bad core-form syntax for {} at {}:{}: {}", c.as_str(), stx.source_location.0, stx.source_location.1, stx),
             Error::AmbiguousBinding(name) => write!(f, "Bad syntax due to ambiguous binding: {}", name),
             Error::NoMatchingPattern(stx) => write!(f, "No macro expansion for pattern: {}", stx),
             Error::UnboundIdentifier(stx) => match &stx.e {
@@ -191,7 +204,7 @@ enum Datum {
     Float(f64),
     Character(char),
     String(String),
-    Symbol(String),
+    Symbol(Cow<'static, str>),
     Bytes(Vec<u8>),
     List,
     ImproperList,
@@ -203,7 +216,7 @@ enum Datum {
 }
 
 #[derive(Debug, Clone)]
-enum MatchValue {
+pub enum MatchValue {
     One(Rc<SyntaxObject>),
     Many(Vec<MatchValue>),
 }
@@ -216,45 +229,51 @@ enum QQExpansion {
 }
 
 static SYNTAX_DEFINITION_PATTERN: std::sync::LazyLock<Pattern> = std::sync::LazyLock::new(|| Pattern::List(vec![
-    Pattern::Literal("define-syntax".into()),
-    Pattern::Variable("name".into()),
+    Pattern::Literal(Cow::Borrowed("define-syntax")),
+    Pattern::Variable(Cow::Borrowed("name")),
     Pattern::List(vec![
-        Pattern::Literal("syntax-rules".into()),
-        Pattern::Variable("literals".into()),
+        Pattern::Literal(Cow::Borrowed("syntax-rules")),
+        Pattern::Variable(Cow::Borrowed("literals")),
         Pattern::Ellipsis(Box::new(Pattern::List(vec![
-            Pattern::Variable("pattern".into()),
-            Pattern::Variable("template".into()),
+            Pattern::Variable(Cow::Borrowed("pattern")),
+            Pattern::Variable(Cow::Borrowed("template")),
         ]))),
     ]),
 ]));
 static VALUE_DEFINITION_PATTERN: std::sync::LazyLock<Pattern> = std::sync::LazyLock::new(|| Pattern::List(vec![
-    Pattern::Literal("define-values".into()),
-    Pattern::List(vec![Pattern::Ellipsis(Box::new(Pattern::Variable("formals".into())))]),
-    Pattern::Variable("expression".into()),
+    Pattern::Literal(Cow::Borrowed("define-values")),
+    Pattern::List(vec![Pattern::Ellipsis(Box::new(Pattern::Variable(Cow::Borrowed("formals"))))]),
+    Pattern::Variable(Cow::Borrowed("expression")),
 ]));
 static SYNTAX_BINDING_PATTERN: std::sync::LazyLock<Pattern> = std::sync::LazyLock::new(|| Pattern::ImproperList(vec![
-    Pattern::Literal("letrec-syntax".into()),
+    Pattern::Literal(Cow::Borrowed("letrec-syntax")),
     Pattern::List(vec![
         Pattern::Ellipsis(Box::new(Pattern::List(vec![
-            Pattern::Variable("name".into()),
+            Pattern::Variable(Cow::Borrowed("name")),
             Pattern::List(vec![
-                Pattern::Literal("syntax-rules".into()),
-                Pattern::Variable("literals".into()),
+                Pattern::Literal(Cow::Borrowed("syntax-rules")),
+                Pattern::Variable(Cow::Borrowed("literals")),
                 Pattern::Ellipsis(Box::new(Pattern::List(vec![
-                    Pattern::Variable("pattern".into()),
-                    Pattern::Variable("template".into()),
+                    Pattern::Variable(Cow::Borrowed("pattern")),
+                    Pattern::Variable(Cow::Borrowed("template")),
                 ]))),
             ]),
         ]))),
     ]),
-], Box::new(Pattern::Variable("body".into()))));
+], Box::new(Pattern::Variable(Cow::Borrowed("body")))));
 static CORE_PRIMITIVES: std::sync::LazyLock<std::collections::HashSet<&'static str>> = std::sync::LazyLock::new(|| [
     "*", "+", "-",
     "list", "cons", "append", "values",
 ].into());
 
 thread_local! {
-    static CORE_FORM_BEGIN_STX: LazyCell<Rc<SyntaxObject>> = const { LazyCell::new(|| Rc::new(SyntaxObject { e: Datum::Symbol("begin".into()), children: vec![], scopes: Default::default(), source_location: (0, 0)})) };
+    static CORE_INTRODUCED_SYNTAXES: LazyCell<std::collections::HashMap<&'static str, Rc<SyntaxObject>>> = const { LazyCell::new(||
+        ["begin", "if", "and"].into_iter()
+            .map(|name| (name, Rc::new(SyntaxObject::simple(Datum::Symbol(Cow::Borrowed(name)), (0, 0)))))
+            .chain(std::iter::once(("#true", Rc::new(SyntaxObject::simple(Datum::Boolean(true), (0, 0))))))
+            .chain(std::iter::once(("#false", Rc::new(SyntaxObject::simple(Datum::Boolean(false), (0, 0))))))
+            .collect()
+    ) };
 }
 
 impl SyntaxObject {
@@ -282,6 +301,22 @@ impl SyntaxObject {
                     .for_each(|stx| Rc::make_mut(stx).add_scope(scope));
             },
             _ => (),
+        }
+    }
+
+    fn is_literal(&self, e: &Literal) -> bool {
+        match (&self.e, e) {
+            (Datum::Boolean(e0), Literal::Copy(LiteralC::Boolean(e1))) => e0 == e1,
+            (Datum::Integer(e0), Literal::Copy(LiteralC::Integer(e1))) => e0 == e1,
+            (Datum::Rational(e0, e2), Literal::Copy(LiteralC::Rational(e1, e3))) => e0 == e1 && e2 == e3,
+            (Datum::Float(e0), Literal::Copy(LiteralC::Float(e1))) => e0 == e1,
+            (Datum::Character(e0), Literal::Copy(LiteralC::Character(e1))) => e0 == e1,
+            (Datum::String(e0), Literal::Clone(LiteralD::String(e1))) => e0 == e1,
+            (Datum::Symbol(e0), Literal::Clone(LiteralD::Symbol(e1))) => e0 == e1,
+            (Datum::Symbol(e0), Literal::Copy(LiteralC::Symbol(e1))) => e0 == e1,
+            (Datum::Bytes(e0), Literal::Clone(LiteralD::Bytes(e1))) => e0 == e1,
+            (Datum::List | Datum::ImproperList | Datum::Vector | Datum::Quote | Datum::Quasiquote | Datum::Unquote | Datum::UnquoteSplicing, _) => &Literal::from(self) == e,
+            _ => false,
         }
     }
 }
@@ -337,6 +372,49 @@ impl std::fmt::Display for SyntaxObject {
     }
 }
 
+impl From<&SyntaxObject> for Literal {
+    fn from(stx: &SyntaxObject) -> Self {
+        match &stx.e {
+            Datum::Boolean(b) => LiteralC::Boolean(*b).into(),
+            Datum::Integer(i) => LiteralC::Integer(*i).into(),
+            Datum::Rational(n, d) => LiteralC::Rational(*n, *d).into(),
+            Datum::Float(f) => LiteralC::Float(*f).into(),
+            Datum::Character(c) => LiteralC::Character(*c).into(),
+            Datum::String(s) => LiteralD::String(s.clone()).into(),
+            Datum::Bytes(items) => LiteralD::Bytes(items.clone()).into(),
+            Datum::Symbol(Cow::Borrowed(s)) => LiteralC::Symbol(s).into(),
+            Datum::Symbol(Cow::Owned(s)) => LiteralD::Symbol(s.clone()).into(),
+            Datum::List => {
+                if stx.children.len() == 0 {
+                    return LiteralC::Nil.into();
+                }
+                if let Datum::Symbol(name) = &stx.children.first().unwrap().e {
+                    if stx.children.len() > 1 {
+                        match name.as_ref() {
+                            "quote" => return LiteralD::List(vec![LiteralC::Symbol("quote").into(), stx.children[1].as_ref().into()], None).into(),
+                            "quasiquote" => return LiteralD::List(vec![LiteralC::Symbol("quasiquote").into(), stx.children[1].as_ref().into()], None).into(),
+                            "unquote" => return LiteralD::List(vec![LiteralC::Symbol("unquote").into(), stx.children[1].as_ref().into()], None).into(),
+                            "unquote-splicing" => return LiteralD::List(vec![LiteralC::Symbol("unquote-splicing").into(), stx.children[1].as_ref().into()], None).into(),
+                            _ => (),
+                        }
+                    }
+                }
+                LiteralD::List(stx.children.iter().map(|stx| stx.as_ref().into()).collect(), None).into()
+            },
+            Datum::ImproperList => {
+                let mut children = stx.children.iter().map(|stx| stx.as_ref().into()).collect::<Vec<_>>();
+                let tail = children.pop().map(Box::new);
+                LiteralD::List(children, tail).into()
+            },
+            Datum::Vector => LiteralD::Vector(stx.children.iter().map(|stx| stx.as_ref().into()).collect()).into(),
+            Datum::Quote => LiteralD::List(vec![LiteralC::Symbol("quote").into(), stx.children[0].as_ref().into()], None).into(),
+            Datum::Quasiquote => LiteralD::List(vec![LiteralC::Symbol("quasiquote").into(), stx.children[0].as_ref().into()], None).into(),
+            Datum::Unquote => LiteralD::List(vec![LiteralC::Symbol("unquote").into(), stx.children[0].as_ref().into()], None).into(),
+            Datum::UnquoteSplicing => LiteralD::List(vec![LiteralC::Symbol("unquote-splicing").into(), stx.children[0].as_ref().into()], None).into(),
+        }
+    }
+}
+
 impl<'a> Pattern {
     pub fn try_match(&'a self, input: &Rc<SyntaxObject>) -> Option<MatchEnv<'a>> {
         match self {
@@ -349,7 +427,7 @@ impl<'a> Pattern {
                 }
                 None
             }
-            Pattern::Variable(v) => Some([(v.as_str(), MatchValue::One(input.clone()))].into_iter().collect()),
+            Pattern::Variable(v) => Some([(v.as_ref(), MatchValue::One(input.clone()))].into_iter().collect()),
             Pattern::List(patterns) if matches!(input.e, Datum::List) => Self::try_match_sequence(patterns, &input.children, None),
             Pattern::ImproperList(patterns, tailcdr) => {
                 if matches!(input.e, Datum::List) {
@@ -366,8 +444,7 @@ impl<'a> Pattern {
             }
             Pattern::Vector(patterns) if matches!(input.e, Datum::Vector) => Self::try_match_sequence(patterns, &input.children, None),
             Pattern::Ellipsis(_) => None, // not allowed here
-            Pattern::Constant(Datum::List | Datum::ImproperList | Datum::Vector) => unreachable!(),
-            Pattern::Constant(datum) if datum == &input.e => Some(Default::default()),
+            Pattern::Constant(c) if input.is_literal(c) => Some(Default::default()),
             _ => None,
         }
     }
@@ -462,10 +539,8 @@ impl<'a> Pattern {
     fn from(stx: &Rc<SyntaxObject>, literals: &std::collections::HashSet<&str>) -> Result<Self, ()> {
         match &stx.e {
             Datum::Symbol(s) if s == "_" => Ok(Pattern::Underscore),
-            Datum::Symbol(s) if literals.contains(s.as_str()) => Ok(Pattern::Literal(s.clone())),
-            Datum::Symbol(s) => Ok(Pattern::Variable(s.clone())),
-            Datum::String(_) | Datum::Character(_) | Datum::Boolean(_) | Datum::Bytes(_) => Ok(Pattern::Constant(stx.e.clone())),
-            Datum::Rational(_, _) | Datum::Integer(_) | Datum::Float(_) => Ok(Pattern::Constant(stx.e.clone())),
+            Datum::Symbol(s) => if literals.contains(s.as_ref()) { Ok(Pattern::Literal(s.clone())) } else { Ok(Pattern::Variable(s.clone())) },
+            Datum::Boolean(_) | Datum::Integer(_) | Datum::Rational(..) | Datum::Character(_) | Datum::Float(_) | Datum::String(_) | Datum::Bytes(_) => Ok(Pattern::Constant(stx.as_ref().into())),
             Datum::List => Ok(Pattern::List(Self::from_sequence(&stx.children, literals)?)),
             Datum::Vector => Ok(Pattern::Vector(Self::from_sequence(&stx.children, literals)?)),
             Datum::ImproperList => Ok(Pattern::ImproperList(
@@ -533,7 +608,7 @@ impl Template {
             match queue.pop_front() {
                 None => return Ok(reps.unwrap_or(0)),
                 Some(Template::Constant(_)) => (),
-                Some(Template::Identifier(s)) => match env.get(s.as_str()) {
+                Some(Template::Identifier(s)) => match env.get(s.as_ref()) {
                     Some(MatchValue::Many(vs)) => match reps {
                         None => reps = Some(vs.len()),
                         Some(r) if r == vs.len() => (),
@@ -576,7 +651,7 @@ impl Template {
     fn apply(&self, env: &MatchSlice, stx: &Rc<SyntaxObject>, expand_scope: usize) -> Result<Rc<SyntaxObject>, Error> {
         match self {
             Template::Constant(stx) => Ok(stx.clone()),
-            Template::Identifier(s) => match env.get(s.as_str()) {
+            Template::Identifier(s) => match env.get(s.as_ref()) {
                 Some(MatchValue::One(stx)) => Ok(stx.clone()),
                 None => Ok(Rc::new(SyntaxObject {
                     e: Datum::Symbol(s.clone()),
@@ -613,25 +688,14 @@ impl Template {
 
 impl Environment {
     pub fn new() -> Self {
-        let mut bindings = std::collections::HashMap::new();
-        bindings.insert(CoreForm::Lambda.to_string(), std::iter::once((ScopeSet::default(), Binding::CoreForm(CoreForm::Lambda))).collect());
-        bindings.insert(CoreForm::If.to_string(), std::iter::once((ScopeSet::default(), Binding::CoreForm(CoreForm::If))).collect());
-        bindings.insert(CoreForm::Begin.to_string(), std::iter::once((ScopeSet::default(), Binding::CoreForm(CoreForm::Begin))).collect());
-        bindings.insert(CoreForm::SetBang.to_string(), std::iter::once((ScopeSet::default(), Binding::CoreForm(CoreForm::SetBang))).collect());
-        bindings.insert(CoreForm::Quote.to_string(), std::iter::once((ScopeSet::default(), Binding::CoreForm(CoreForm::Quote))).collect());
-        bindings.insert(CoreForm::Quasiquote.to_string(), std::iter::once((ScopeSet::default(), Binding::CoreForm(CoreForm::Quasiquote))).collect());
-        bindings.insert(CoreForm::Unquote.to_string(), std::iter::once((ScopeSet::default(), Binding::CoreForm(CoreForm::Unquote))).collect());
-        bindings.insert(CoreForm::UnquoteSplicing.to_string(), std::iter::once((ScopeSet::default(), Binding::CoreForm(CoreForm::UnquoteSplicing))).collect());
-        bindings.insert(CoreForm::DefineValues.to_string(), std::iter::once((ScopeSet::default(), Binding::CoreForm(CoreForm::DefineValues))).collect());
-        bindings.insert("define-syntax".into(), std::iter::once((ScopeSet::default(), Binding::ExpandOnlyCoreForm)).collect());
-        bindings.insert("letrec-syntax".into(), std::iter::once((ScopeSet::default(), Binding::ExpandOnlyCoreForm)).collect());
-        for &name in CORE_PRIMITIVES.iter() {
-            bindings.insert(name.to_string(), std::iter::once((ScopeSet::default(), Binding::CorePrimitive(name))).collect());
-        }
-
+        let (core_macro_names, core_macros) = build_core_macros();
         Self {
-            macros: std::collections::VecDeque::new(),
-            bindings,
+            macros: std::collections::VecDeque::from(core_macros),
+            bindings: [CoreForm::Lambda, CoreForm::If, CoreForm::Begin, CoreForm::SetBang, CoreForm::Quote, CoreForm::Quasiquote, CoreForm::Unquote, CoreForm::UnquoteSplicing, CoreForm::DefineValues].into_iter()
+                .map(|cf| (Cow::Borrowed(cf.as_str()), std::iter::once((ScopeSet::default(), Binding::CoreForm(cf))).collect()))
+                .chain(CORE_PRIMITIVES.iter().map(|&name| (Cow::Borrowed(name), std::iter::once((ScopeSet::default(), Binding::CorePrimitive(name))).collect())))
+                .chain(core_macro_names.iter().enumerate().map(|(i, &name)| (Cow::Borrowed(name), std::iter::once((ScopeSet::default(), Binding::SyntaxTransformer(i))).collect())))
+                .collect(),
             scope_counter: Cell::new(1),
             bound_id_counter: Cell::new(1),
         }
@@ -649,7 +713,7 @@ impl Environment {
     }
     fn resolve(&self, stx: &Rc<SyntaxObject>) -> Result<Option<Binding>, Error> {
         let (name, mut candidates) = match &stx.e {
-            Datum::Symbol(name) => match self.bindings.get(name) {
+            Datum::Symbol(name) => match self.bindings.get(name.as_ref()) {
                 Some(bindings) => (name, bindings.iter().filter(|(c_scopes, _)| c_scopes.is_subset(&stx.scopes))),
                 None => return Ok(None),
             },
@@ -667,7 +731,7 @@ impl Environment {
         }
     }
 
-    fn parse_syntax_definition(stx: Rc<SyntaxObject>) -> Result<Option<(String, Vec<Pattern>, Vec<Template>)>, Error> {
+    fn parse_syntax_definition(stx: Rc<SyntaxObject>) -> Result<Option<(Cow<'static, str>, Vec<Pattern>, Vec<Template>)>, Error> {
         if let Some(matches) = SYNTAX_DEFINITION_PATTERN.try_match(&stx) {
             let name = match matches.get("name") {
                 Some(MatchValue::One(name_stx)) => {
@@ -683,7 +747,7 @@ impl Environment {
                 Some(MatchValue::One(literals_stx)) => {
                     literals_stx.children.iter().map(|c| {
                         if let Datum::Symbol(s) = &c.e {
-                            Ok(s.as_str())
+                            Ok(s.as_ref())
                         } else {
                             Err(Error::BadSyntax(literals_stx.clone()))
                         }
@@ -793,7 +857,7 @@ impl Environment {
                     Rc::make_mut(&mut stx).children[1] = child;
                 }
                 return Ok((stx, modified));
-            } else if matches!(head, Some(Binding::CoreForm(CoreForm::Quote) | Binding::ExpandOnlyCoreForm)) {
+            } else if matches!(head, Some(Binding::CoreForm(CoreForm::Quote))) {
                 return Ok((stx, false));
             }
         } else if matches!(stx.e, Datum::Quote) {
@@ -838,7 +902,7 @@ impl Environment {
                         None => return Err(Error::BadCoreFormSyntax(CoreForm::Lambda, stx.children[1].clone())),
                         Some(Datum::Symbol(name)) => {
                             let b = Binding::Variable(self.new_variable());
-                            match self.bindings.get_mut(name) {
+                            match self.bindings.get_mut(name.as_ref()) {
                                 Some(bb) => bb,
                                 None => self.bindings.entry(name.clone()).or_default(),
                             }.insert(stx.children[1].scopes.clone(), b);
@@ -851,7 +915,7 @@ impl Environment {
                                     _ => None,
                                 }).for_each(|(name, scopes)| {
                                     let b = Binding::Variable(self.new_variable());
-                                    match self.bindings.get_mut(name) {
+                                    match self.bindings.get_mut(name.as_ref()) {
                                         Some(bb) => bb,
                                         None => self.bindings.entry(name.clone()).or_default(),
                                     }.insert(scopes.clone(), b);
@@ -874,7 +938,7 @@ impl Environment {
                         .map(|c| self.add_binding_scopes(Rc::make_mut(c)))
                         .collect::<Result<(), _>>()?;
                 },
-                Some(Binding::CoreForm(CoreForm::Quote) | Binding::ExpandOnlyCoreForm) => (),
+                Some(Binding::CoreForm(CoreForm::Quote)) => (),
                 _ => {
                     stx.children.iter_mut()
                         .map(|c| self.add_binding_scopes(Rc::make_mut(c)))
@@ -898,7 +962,7 @@ impl Environment {
 
     fn define_inner(&mut self, mut stx: Rc<SyntaxObject>) -> Result<Rc<SyntaxObject>, Error> {
         if let Some((name, patterns, templates)) = Self::parse_syntax_definition(stx.clone())? {
-            match self.bindings.get_mut(&name) {
+            match self.bindings.get_mut(name.as_ref()) {
                 Some(bb) => bb.insert(stx.scopes.clone(), Binding::SyntaxTransformer(self.macros.len())).map(|_| ()),
                 None => self.bindings.insert(name, std::iter::once((stx.scopes.clone(), Binding::SyntaxTransformer(self.macros.len()))).collect()).map(|_| ()),
             };
@@ -912,7 +976,7 @@ impl Environment {
                             MatchValue::One(stx) => {
                                 let b = Binding::Variable(self.new_variable());
                                 match &**stx {
-                                    SyntaxObject { e: Datum::Symbol(name), scopes, ..} => match self.bindings.get_mut(name) {
+                                    SyntaxObject { e: Datum::Symbol(name), scopes, ..} => match self.bindings.get_mut(name.as_ref()) {
                                         Some(bb) => bb,
                                         None => self.bindings.entry(name.clone()).or_default(),
                                     }.insert(scopes.clone(), b),
@@ -940,7 +1004,7 @@ impl Environment {
                 _ => unreachable!(),
             };
             for (i, name) in names.iter().enumerate() {
-                match self.bindings.get_mut(name) {
+                match self.bindings.get_mut(name.as_ref()) {
                     Some(bb) => bb,
                     None => self.bindings.entry(name.clone()).or_default(),
                 }.insert(body_scopes.clone(), Binding::SyntaxTransformer(self.macros.len() + i));
@@ -950,7 +1014,7 @@ impl Environment {
                 Some(MatchValue::Many(vs)) => vs.iter().map(|v| match v {
                     MatchValue::One(literals_stx) => literals_stx.children.iter()
                         .map(|c| if let Datum::Symbol(s) = &c.e {
-                            Ok(s.as_str())
+                            Ok(s.as_ref())
                         } else {
                             Err(Error::BadSyntax(literals_stx.clone()))
                         }).collect::<Result<std::collections::HashSet<_>, Error>>(),
@@ -985,7 +1049,7 @@ impl Environment {
                 self.macros.push_back(std::iter::zip(p, t).collect());
             }
 
-            let mut bodys = vec![CORE_FORM_BEGIN_STX.with(|c| LazyCell::force(c).clone())];
+            let mut bodys = vec![CORE_INTRODUCED_SYNTAXES.with(|c| LazyCell::force(c).get("begin").unwrap().clone())];
             bodys.extend(match matches.get("body") {
                 Some(MatchValue::Many(vs)) => vs.iter().map(|v| match v {
                     MatchValue::One(stx) => stx.clone(),
@@ -1010,7 +1074,7 @@ impl Environment {
 
     fn qquote_syntax(&self, stx: &Rc<SyntaxObject>, depth: usize) -> Result<Expression, Error> {
         match &stx.e {
-            Datum::Boolean(_) | Datum::Integer(_) | Datum::Rational(_, _) | Datum::Float(_) | Datum::Character(_) | Datum::String(_) | Datum::Symbol(_) | Datum::Bytes(_) | Datum::Quote | Datum::Vector => Ok(Expression::Literal(self.literal_syntax(stx))),
+            Datum::Boolean(_) | Datum::Integer(_) | Datum::Rational(_, _) | Datum::Float(_) | Datum::Character(_) | Datum::String(_) | Datum::Symbol(_) | Datum::Bytes(_) | Datum::Quote | Datum::Vector => Ok(Expression::Literal(stx.as_ref().into())),
             Datum::Quasiquote => Ok(Expression::ProcedureCall {
                 operator: Box::new(Expression::CorePrimitive("list")),
                 operands: (vec![LiteralC::Symbol("quasiquote").into(),
@@ -1080,7 +1144,7 @@ impl Environment {
                 Some(head) => match self.resolve(head)? {
                     Some(Binding::CoreForm(CoreForm::Quote)) => match stx.children.get(1) {
                         None => Err(Error::BadCoreFormSyntax(CoreForm::Quote, stx.clone())),
-                        Some(stx) => Ok(Expression::Literal(self.literal_syntax(stx))),
+                        Some(stx) => Ok(Expression::Literal(stx.as_ref().into())),
                     },
                     Some(Binding::CoreForm(CoreForm::Quasiquote)) => match stx.children.get(1) {
                         None => Err(Error::BadCoreFormSyntax(CoreForm::Quasiquote, stx.clone())),
@@ -1123,7 +1187,7 @@ impl Environment {
             let mut q = None;
             if matches!(stx.e, Datum::List) && stx.children.len() > 1 {
                 if let Datum::Symbol(name) = &stx.children.first().unwrap().e {
-                    q = match name.as_str() {
+                    q = match name.as_ref() {
                         "unquote" => Some(QQExpansion::Unquote(self.qquote_syntax(&stx.children[1], depth - 1)?)),
                         "unquote-splicing" => Some(QQExpansion::UnquoteSplicing(self.qquote_syntax(&stx.children[1], depth - 1)?)),
                         _ => None,
@@ -1195,49 +1259,10 @@ impl Environment {
             }
         }
     }
-    fn literal_syntax(&self, stx: &Rc<SyntaxObject>) -> Literal {
-        match &stx.e {
-            Datum::Boolean(b) => LiteralC::Boolean(*b).into(),
-            Datum::Integer(i) => LiteralC::Integer(*i).into(),
-            Datum::Rational(n, d) => LiteralC::Rational(*n, *d).into(),
-            Datum::Float(f) => LiteralC::Float(*f).into(),
-            Datum::Character(c) => LiteralC::Character(*c).into(),
-            Datum::String(s) => LiteralD::String(s.clone()).into(),
-            Datum::Bytes(items) => LiteralD::Bytes(items.clone()).into(),
-            Datum::Symbol(s) => LiteralD::Symbol(s.clone()).into(),
-            Datum::List => {
-                if stx.children.len() == 0 {
-                    return LiteralC::Nil.into();
-                }
-                if let Datum::Symbol(name) = &stx.children.first().unwrap().e {
-                    if stx.children.len() > 1 {
-                        match name.as_str() {
-                            "quote" => return LiteralD::List(vec![LiteralC::Symbol("quote").into(), self.literal_syntax(&stx.children[1])], None).into(),
-                            "quasiquote" => return LiteralD::List(vec![LiteralC::Symbol("quasiquote").into(), self.literal_syntax(&stx.children[1])], None).into(),
-                            "unquote" => return LiteralD::List(vec![LiteralC::Symbol("unquote").into(), self.literal_syntax(&stx.children[1])], None).into(),
-                            "unquote-splicing" => return LiteralD::List(vec![LiteralC::Symbol("unquote-splicing").into(), self.literal_syntax(&stx.children[1])], None).into(),
-                            _ => (),
-                        }
-                    }
-                }
-                LiteralD::List(stx.children.iter().map(|stx| self.literal_syntax(stx)).collect(), None).into()
-            },
-            Datum::ImproperList => {
-                let mut children = stx.children.iter().map(|stx| self.literal_syntax(stx)).collect::<Vec<_>>();
-                let tail = children.pop().map(Box::new);
-                LiteralD::List(children, tail).into()
-            },
-            Datum::Vector => LiteralD::Vector(stx.children.iter().map(|stx| self.literal_syntax(stx)).collect()).into(),
-            Datum::Quote => LiteralD::List(vec![LiteralC::Symbol("quote").into(), self.literal_syntax(stx.children.first().unwrap())], None).into(),
-            Datum::Quasiquote => LiteralD::List(vec![LiteralC::Symbol("quasiquote").into(), self.literal_syntax(stx.children.first().unwrap())], None).into(),
-            Datum::Unquote => LiteralD::List(vec![LiteralC::Symbol("unquote").into(), self.literal_syntax(stx.children.first().unwrap())], None).into(),
-            Datum::UnquoteSplicing => LiteralD::List(vec![LiteralC::Symbol("unquote-splicing").into(), self.literal_syntax(stx.children.first().unwrap())], None).into(),
-        }
-    }
     fn resolve_syntax(&self, stx: &Rc<SyntaxObject>) -> Result<Expression, Error> {
         match &stx.e {
-            Datum::Boolean(_) | Datum::Integer(_) | Datum::Rational(_, _) | Datum::Float(_) | Datum::Character(_) | Datum::String(_) | Datum::Bytes(_) | Datum::Vector => Ok(Expression::Literal(self.literal_syntax(stx))),
-            Datum::Quote => Ok(Expression::Literal(self.literal_syntax(stx.children.first().unwrap()))),
+            Datum::Boolean(_) | Datum::Integer(_) | Datum::Rational(_, _) | Datum::Float(_) | Datum::Character(_) | Datum::String(_) | Datum::Bytes(_) | Datum::Vector => Ok(Expression::Literal(stx.as_ref().into())),
+            Datum::Quote => Ok(Expression::Literal(stx.children[0].as_ref().into())),
             Datum::Quasiquote => self.qquote_syntax(stx.children.first().unwrap(), 1),
             Datum::Unquote | Datum::UnquoteSplicing => Err(Error::BadSyntax(stx.clone())),
             Datum::Symbol(_) => match self.resolve(&stx)? {
@@ -1277,7 +1302,7 @@ impl Environment {
                                 .collect::<Result<Vec<_>, _>>()?, None),
                         }),
                     },
-                    Some(Binding::ExpandOnlyCoreForm | Binding::SyntaxTransformer(_)) => Err(Error::BadSyntax(stx.clone())),
+                    Some(Binding::SyntaxTransformer(_)) => Err(Error::BadSyntax(stx.clone())),
                     Some(Binding::CorePrimitive(s)) => Ok(Expression::ProcedureCall {
                         operator: Box::new(Expression::CorePrimitive(s)),
                         operands: (stx.children.iter().skip(1)
@@ -1355,7 +1380,7 @@ impl Environment {
                     }),
                     Some(Binding::CoreForm(CoreForm::Quote)) => match stx.children.get(1) {
                         None => return Err(Error::BadCoreFormSyntax(CoreForm::Quote, stx.clone())),
-                        Some(stx) => Ok(Expression::Literal(self.literal_syntax(stx))),
+                        Some(stx) => Ok(Expression::Literal(stx.as_ref().into())),
                     },
                     Some(Binding::CoreForm(CoreForm::Quasiquote)) => match stx.children.get(1) {
                         None => return Err(Error::BadCoreFormSyntax(CoreForm::Quasiquote, stx.clone())),
@@ -1397,7 +1422,6 @@ impl Environment {
                             Some(stx) => self.resolve_syntax(stx).map(Box::new)?,
                         }
                     }),
-                    Some(Binding::CoreForm(CoreForm::_MaxValue)) => panic!(),
                 },
             },
         }
@@ -1431,7 +1455,7 @@ fn read_datum(port: &mut InputPort, token: Option<(Token, (usize, usize))>) -> R
         },
         Token::Identifier(s) => {
             let s = parse_identifier(s).map_err(|_| Error::InvalidCharacter)?;
-            Ok(SyntaxObject::simple(Datum::Symbol(s), source_location))
+            Ok(SyntaxObject::simple(Datum::Symbol(Cow::Owned(s)), source_location))
         },
         Token::Open => {
             let mut children = Vec::new();
@@ -2194,9 +2218,7 @@ fn radix(port: &mut InputPort, offset: usize, base: i32) -> Result<Option<usize>
 }
 
 /******** expander ********/
-
-pub fn expand(stx: SyntaxObject, env: &mut Environment) -> Result<Expression, Error>
-{
+pub fn expand(stx: SyntaxObject, env: &mut Environment) -> Result<Expression, Error> {
     eprintln!("step1: {}", stx);
     let stx = env.define_early(Rc::new(stx))?;
     let stx = env.expand_and_scope(stx)?;
@@ -2205,4 +2227,32 @@ pub fn expand(stx: SyntaxObject, env: &mut Environment) -> Result<Expression, Er
     let stx = env.expand_and_scope(stx)?;
     eprintln!("step3: {}", stx);
     env.resolve_syntax(&stx)
+}
+
+/******** built-in macros ********/
+fn build_core_macros() -> (Vec<&'static str>, Vec<Rules>) {
+    [
+        ("and", [
+            (
+                Pattern::List(vec![Pattern::Literal(Cow::Borrowed("and"))]),
+                Template::Constant(CORE_INTRODUCED_SYNTAXES.with(|c| LazyCell::force(c).get("#true").unwrap().clone()))
+            ),
+            (
+                Pattern::List(vec![Pattern::Literal(Cow::Borrowed("and")), Pattern::Variable(Cow::Borrowed("test"))]),
+                Template::Identifier(Cow::Borrowed("test")),
+            ),
+            (
+                Pattern::List(vec![Pattern::Literal(Cow::Borrowed("and")), Pattern::Variable(Cow::Borrowed("test1")), Pattern::Ellipsis(Box::new(Pattern::Variable(Cow::Borrowed("test2"))))]),
+                Template::List(vec![
+                    Template::Constant(CORE_INTRODUCED_SYNTAXES.with(|c| LazyCell::force(c).get("if").unwrap().clone())),
+                    Template::Identifier(Cow::Borrowed("test1")),
+                    Template::List(vec![
+                        Template::Constant(CORE_INTRODUCED_SYNTAXES.with(|c| LazyCell::force(c).get("and").unwrap().clone())),
+                        Template::Ellipsis(Box::new(Template::Identifier(Cow::Borrowed("test2")))),
+                    ]),
+                    Template::Constant(CORE_INTRODUCED_SYNTAXES.with(|c| LazyCell::force(c).get("#false").unwrap().clone())),
+                ]),
+            ),
+        ].into_iter().collect()),
+    ].into_iter().collect()
 }
