@@ -1,5 +1,3 @@
-use std::vec;
-
 use crate::syntax;
 use crate::syntax::{LiteralC, LiteralD};
 
@@ -135,16 +133,11 @@ impl crate::Environment {
                 } },
             syntax::Expression::ProcedureCall { operator, operands } => {
                 self.atomize(*operator, kf, move |operator|
-                    self.atomize_many(operands.0, kf, move |operands_0| match operands.1 {
-                        None => Expression::Apply { operator,
-                            operands: (operands_0, None),
+                    self.atomize_many(operands, kf, move |operands| Expression::Apply {
+                            operator,
+                            operands: (operands, None),
                             k: Continuation::Variable(k),
-                            kf: Continuation::Variable(kf) },
-                        Some(operands_1) => self.atomize(*operands_1, kf, move |operands_1| Expression::Apply { operator,
-                            operands: (operands_0, Some(operands_1)),
-                            k: Continuation::Variable(k),
-                            kf: Continuation::Variable(kf) }),
-                    }))
+                            kf: Continuation::Variable(kf) }))
             }
             syntax::Expression::Lambda { formals, body } => {
                 let x = ValueID(self.new_variable());
