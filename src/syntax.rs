@@ -22,7 +22,7 @@ pub enum Expression {
     CorePrimitive(&'static str),
     Variable(usize),
     Literal(Literal),
-    ProcedureCall { operator: Box<Expression>, operands: (Vec<Expression>, Option<Box<Expression>>) },
+    ProcedureCall { operator: Box<Expression>, operands: Vec<Expression> },
     Lambda { formals: (Vec<Expression>, Option<Box<Expression>>), body: Vec<Expression> },
     Conditional { test: Box<Expression>, consequent: Box<Expression>, alternate: Option<Box<Expression>> },
     Assignment { id: Box<Expression>, value: Box<Expression> },
@@ -686,7 +686,7 @@ impl Template {
     }
 }
 
-impl Environment {
+impl crate::Environment {
     pub fn new() -> Self {
         let (core_macro_names, core_macros) = build_core_macros();
         Self {
@@ -1077,16 +1077,16 @@ impl Environment {
             Datum::Boolean(_) | Datum::Integer(_) | Datum::Rational(_, _) | Datum::Float(_) | Datum::Character(_) | Datum::String(_) | Datum::Symbol(_) | Datum::Bytes(_) | Datum::Quote | Datum::Vector => Ok(Expression::Literal(stx.as_ref().into())),
             Datum::Quasiquote => Ok(Expression::ProcedureCall {
                 operator: Box::new(Expression::CorePrimitive("list")),
-                operands: (vec![LiteralC::Symbol("quasiquote").into(),
-                    self.qquote_syntax(stx.children.first().unwrap(), depth + 1)?], None),
+                operands: vec![LiteralC::Symbol("quasiquote").into(),
+                    self.qquote_syntax(stx.children.first().unwrap(), depth + 1)?],
             }),
             Datum::Unquote => if depth == 1 {
                 self.resolve_syntax(stx.children.first().unwrap())
             } else {
                 Ok(Expression::ProcedureCall {
                     operator: Box::new(Expression::CorePrimitive("list")),
-                    operands: (vec![LiteralC::Symbol("unquote").into(),
-                        self.qquote_syntax(stx.children.first().unwrap(), depth - 1)?], None),
+                    operands: vec![LiteralC::Symbol("unquote").into(),
+                        self.qquote_syntax(stx.children.first().unwrap(), depth - 1)?],
                 })
             },
             Datum::UnquoteSplicing => if depth == 1 {
@@ -1094,8 +1094,8 @@ impl Environment {
             } else {
                 Ok(Expression::ProcedureCall {
                     operator: Box::new(Expression::CorePrimitive("list")),
-                    operands: (vec![LiteralC::Symbol("unquote-splicing").into(),
-                        self.qquote_syntax(stx.children.first().unwrap(), depth - 1)?], None),
+                    operands: vec![LiteralC::Symbol("unquote-splicing").into(),
+                        self.qquote_syntax(stx.children.first().unwrap(), depth - 1)?],
                 })
             },
             Datum::ImproperList => {
@@ -1105,28 +1105,24 @@ impl Environment {
                         Ok(LiteralD::List(ee, tail).into())
                     },
                     Expression::ProcedureCall { operator, mut operands } => match *operator {
-                        Expression::CorePrimitive("list") => if let Some(tail) = operands.0.pop() {
+                        Expression::CorePrimitive("list") => if let Some(tail) = operands.pop() {
                             Ok(Expression::ProcedureCall {
                                 operator: Box::new(Expression::CorePrimitive("append")),
-                                operands: (vec![Expression::ProcedureCall {
+                                operands: vec![Expression::ProcedureCall {
                                     operator: Box::new(Expression::CorePrimitive("list")),
                                     operands,
-                                }, tail], None),
+                                }, tail],
                             })
                         } else {
                             Ok(Expression::ProcedureCall { operator, operands })
                         },
-                        Expression::CorePrimitive("append") => match operands.0.last() {
+                        Expression::CorePrimitive("append") => match operands.pop() {
                             None => Ok(LiteralC::Nil.into()),
-                            Some(Expression::ProcedureCall { operator: sub_operator, .. }) if matches!(**sub_operator, Expression::CorePrimitive("list")) => if let Some(tail) = operands.0.pop() {
-                                Ok(Expression::ProcedureCall {
-                                    operator: Box::new(Expression::CorePrimitive("append")),
-                                    operands: (vec![Expression::ProcedureCall {
-                                        operator: Box::new(Expression::CorePrimitive("list")),
-                                        operands,
-                                    }, tail], None),
-                                })
-                            } else {
+                            Some(Expression::ProcedureCall { operator: sub_operator, operands: mut sub_operands }) if matches!(*sub_operator, Expression::CorePrimitive("list")) => {
+                                if let Some(tail) = sub_operands.pop() {
+                                    operands.push(Expression::ProcedureCall { operator: sub_operator, operands: sub_operands });
+                                    operands.push(tail);
+                                }
                                 Ok(Expression::ProcedureCall { operator, operands })
                             },
                             Some(_) => Err(Error::BadCoreFormSyntax(CoreForm::UnquoteSplicing, stx.clone())),
@@ -1136,7 +1132,7 @@ impl Environment {
                     _ => unreachable!(),
                 }
                 // e is either: Literal(List(vec, None)), so we just take the last atom out and stick it in the tail.
-                // or ProcedureCall(list, ...), so we just take the last one out and say (cons [orig] [tail])
+                // or ProcedureCall(list, ...), so we just take the last one out and say (append [orig] [tail])
                 // or ProcedureCall(append, ...), so we find the last child (which will be a list) and do ^^
             },
             Datum::List => match stx.children.first() {
@@ -1150,7 +1146,7 @@ impl Environment {
                         None => Err(Error::BadCoreFormSyntax(CoreForm::Quasiquote, stx.clone())),
                         Some(stx) => Ok(Expression::ProcedureCall {
                             operator: Box::new(Expression::CorePrimitive("list")),
-                            operands: (vec![LiteralC::Symbol("quasiquote").into(), self.qquote_syntax(stx.children.first().unwrap(), depth + 1)?], None),
+                            operands: vec![LiteralC::Symbol("quasiquote").into(), self.qquote_syntax(stx.children.first().unwrap(), depth + 1)?],
                         }),
                     },
                     Some(Binding::CoreForm(CoreForm::Unquote)) => match stx.children.get(1) {
@@ -1160,7 +1156,7 @@ impl Environment {
                         } else {
                             Ok(Expression::ProcedureCall {
                                 operator: Box::new(Expression::CorePrimitive("list")),
-                                operands: (vec![LiteralC::Symbol("unquote").into(), self.qquote_syntax(stx, depth - 1)?], None),
+                                operands: vec![LiteralC::Symbol("unquote").into(), self.qquote_syntax(stx, depth - 1)?],
                             })
                         },
                     },
@@ -1171,7 +1167,7 @@ impl Environment {
                         } else {
                             Ok(Expression::ProcedureCall {
                                 operator: Box::new(Expression::CorePrimitive("list")),
-                                operands: (vec![LiteralC::Symbol("unquote-splicing").into(), self.qquote_syntax(stx, depth - 1)?], None),
+                                operands: vec![LiteralC::Symbol("unquote-splicing").into(), self.qquote_syntax(stx, depth - 1)?],
                             })
                         },
                     },
@@ -1207,20 +1203,20 @@ impl Environment {
                 (false, QQExpansion::Literal(e)) => {
                     append_items.push(Expression::ProcedureCall {
                         operator: Box::new(Expression::CorePrimitive("list")),
-                        operands: (vec![Expression::Literal(e)], None)
+                        operands: vec![Expression::Literal(e)],
                     });
                     true
                 },
                 (false, QQExpansion::Unquote(e)) => {
                     append_items.push(Expression::ProcedureCall {
                         operator: Box::new(Expression::CorePrimitive("list")),
-                        operands: (vec![e], None)
+                        operands: vec![e],
                     });
                     true
                 },
                 (true, QQExpansion::Literal(e)) => {
                     if let Expression::ProcedureCall { operands, .. } = append_items.last_mut().unwrap() {
-                        operands.0.push(Expression::Literal(e));
+                        operands.push(Expression::Literal(e));
                         true
                     } else {
                         unreachable!()
@@ -1228,7 +1224,7 @@ impl Environment {
                 },
                 (true, QQExpansion::Unquote(e)) => {
                     if let Expression::ProcedureCall { operands, .. } = append_items.last_mut().unwrap() {
-                        operands.0.push(e);
+                        operands.push(e);
                         true
                     } else {
                         unreachable!()
@@ -1244,13 +1240,13 @@ impl Environment {
         if append_items.len() > 1 {
             Ok(Expression::ProcedureCall {
                 operator: Box::new(Expression::CorePrimitive("append")),
-                operands: (append_items, None)
+                operands: append_items,
             })
         } else {
             match append_items.pop() {
                 None => Ok(LiteralC::Nil.into()),
-                Some(Expression::ProcedureCall { operands: (literals, None), .. }) if literals.iter().all(|q| matches!(q, Expression::Literal(_))) => {
-                    Ok(Expression::Literal(Literal::Clone(LiteralD::List(literals.into_iter().map(|q| match q {
+                Some(Expression::ProcedureCall { operands, .. }) if operands.iter().all(|q| matches!(q, Expression::Literal(_))) => {
+                    Ok(Expression::Literal(Literal::Clone(LiteralD::List(operands.into_iter().map(|q| match q {
                         Expression::Literal(e) => e,
                         _ => unreachable!(),
                     }).collect(), None))))
@@ -1271,21 +1267,7 @@ impl Environment {
                 Some(_) => Err(Error::BadSyntax(stx.clone())),
                 None => Err(Error::UnboundIdentifier(stx.clone())),
             },
-            Datum::ImproperList => match stx.children.first() {
-                None => Ok(LiteralC::Nil.into()),
-                Some(head) => {
-                    let operator = match self.resolve_syntax(head) {
-                        Ok(expr) => Box::new(expr),
-                        Err(Error::BadSyntax(_)) => return Err(Error::BadSyntax(stx.clone())),
-                        Err(e) => return Err(e),
-                    };
-                    let mut operands = stx.children.iter().skip(1)
-                        .map(|stx| self.resolve_syntax(stx))
-                        .collect::<Result<Vec<_>, _>>()?;
-                    let tail = operands.pop().map(Box::new);
-                    Ok(Expression::ProcedureCall { operator, operands: (operands, tail) })
-                },
-            },
+            Datum::ImproperList => return Err(Error::BadSyntax(stx.clone())),
             Datum::List => match stx.children.first() {
                 None => Ok(LiteralC::Nil.into()),
                 Some(head) => match self.resolve(head)? {
@@ -1297,22 +1279,22 @@ impl Environment {
                                 Err(Error::BadSyntax(_)) => return Err(Error::BadSyntax(stx.clone())),
                                 Err(e) => return Err(e),
                             },
-                            operands: (stx.children.iter().skip(1)
+                            operands: stx.children.iter().skip(1)
                                 .map(|stx| self.resolve_syntax(stx))
-                                .collect::<Result<Vec<_>, _>>()?, None),
+                                .collect::<Result<Vec<_>, _>>()?,
                         }),
                     },
                     Some(Binding::SyntaxTransformer(_)) => Err(Error::BadSyntax(stx.clone())),
                     Some(Binding::CorePrimitive(s)) => Ok(Expression::ProcedureCall {
                         operator: Box::new(Expression::CorePrimitive(s)),
-                        operands: (stx.children.iter().skip(1)
+                        operands: stx.children.iter().skip(1)
                             .map(|stx| self.resolve_syntax(stx))
-                            .collect::<Result<Vec<_>, _>>()?, None) }),
+                            .collect::<Result<Vec<_>, _>>()? }),
                     Some(Binding::Variable(i)) => Ok(Expression::ProcedureCall {
                         operator: Box::new(Expression::Variable(i)),
-                        operands: (stx.children.iter().skip(1)
+                        operands: stx.children.iter().skip(1)
                             .map(|stx| self.resolve_syntax(stx))
-                            .collect::<Result<Vec<_>, _>>()?, None) }),
+                            .collect::<Result<Vec<_>, _>>()? }),
                     Some(Binding::CoreForm(CoreForm::Lambda)) => Ok(Expression::Lambda {
                         formals: match stx.children.get(1) {
                             None => return Err(Error::BadCoreFormSyntax(CoreForm::Lambda, stx.clone())),
