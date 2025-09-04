@@ -30,6 +30,6 @@ fn main() {
 
         let k_dummy = cps::ContinuationID(usize::MAX);
         let se = cps::transform(se, k_dummy, k_dummy, &e_env);
-        println!("final form: {:#?}", se);
+        println!("final form: {:?}", se);
     }
 }

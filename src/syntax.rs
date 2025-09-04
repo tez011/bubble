@@ -41,9 +41,9 @@ pub enum Literal {
 impl From<LiteralC> for Literal { fn from(x: LiteralC) -> Self { Self::Copy(x) } }
 impl From<LiteralD> for Literal { fn from(x: LiteralD) -> Self { Self::Clone(x) } }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, Default)]
 pub enum LiteralC {
-    Nil,
+    #[default] Nil,
     Boolean(bool),
     Integer(i64),
     Rational(i64, i64),
@@ -67,8 +67,9 @@ impl PartialEq for LiteralC {
 impl Eq for LiteralC {
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub enum LiteralD {
+    #[default] Nil,
     String(String),
     Bytes(Vec<u8>),
     Symbol(String),
@@ -81,7 +82,7 @@ pub enum CoreForm {
     Lambda,
     If,
     Begin,
-    SetBang,
+    SetValues,
     Quote,
     Quasiquote,
     Unquote,
@@ -94,7 +95,7 @@ impl CoreForm {
             CoreForm::Lambda => "lambda",
             CoreForm::If => "if",
             CoreForm::Begin => "begin",
-            CoreForm::SetBang => "set!",
+            CoreForm::SetValues => "set-values!",
             CoreForm::Quote => "quote",
             CoreForm::Quasiquote => "quasiquote",
             CoreForm::Unquote => "unquote",
@@ -262,13 +263,15 @@ static SYNTAX_BINDING_PATTERN: std::sync::LazyLock<Pattern> = std::sync::LazyLoc
     ]),
 ], Box::new(Pattern::Variable(Cow::Borrowed("body")))));
 static CORE_PRIMITIVES: std::sync::LazyLock<std::collections::HashSet<&'static str>> = std::sync::LazyLock::new(|| [
-    "*", "+", "-",
-    "list", "cons", "append", "values",
+    "*", "+", "-", "=",
+    "list", "cons", "append",
+    "apply", "call/cc", "call-with-current-continuation", "values", "call-with-values",
+    "dynamic-wind", "with-exception-handler", "raise", "raise-continuable",
 ].into());
 
 thread_local! {
     static CORE_INTRODUCED_SYNTAXES: LazyCell<std::collections::HashMap<&'static str, Rc<SyntaxObject>>> = const { LazyCell::new(||
-        ["begin", "if", "and"].into_iter()
+        ["begin"].into_iter()
             .map(|name| (name, Rc::new(SyntaxObject::simple(Datum::Symbol(Cow::Borrowed(name)), (0, 0)))))
             .chain(std::iter::once(("#true", Rc::new(SyntaxObject::simple(Datum::Boolean(true), (0, 0))))))
             .chain(std::iter::once(("#false", Rc::new(SyntaxObject::simple(Datum::Boolean(false), (0, 0))))))
@@ -686,12 +689,14 @@ impl Template {
     }
 }
 
+const MAX_RESERVED_VARIABLES: usize = 1024;
+const MAX_VARIABLE_ID: usize = usize::MAX - MAX_RESERVED_VARIABLES;
 impl crate::Environment {
     pub fn new() -> Self {
         let (core_macro_names, core_macros) = build_core_macros();
         Self {
             macros: std::collections::VecDeque::from(core_macros),
-            bindings: [CoreForm::Lambda, CoreForm::If, CoreForm::Begin, CoreForm::SetBang, CoreForm::Quote, CoreForm::Quasiquote, CoreForm::Unquote, CoreForm::UnquoteSplicing, CoreForm::DefineValues].into_iter()
+            bindings: [CoreForm::Lambda, CoreForm::If, CoreForm::Begin, CoreForm::SetValues, CoreForm::Quote, CoreForm::Quasiquote, CoreForm::Unquote, CoreForm::UnquoteSplicing, CoreForm::DefineValues].into_iter()
                 .map(|cf| (Cow::Borrowed(cf.as_str()), std::iter::once((ScopeSet::default(), Binding::CoreForm(cf))).collect()))
                 .chain(CORE_PRIMITIVES.iter().map(|&name| (Cow::Borrowed(name), std::iter::once((ScopeSet::default(), Binding::CorePrimitive(name))).collect())))
                 .chain(core_macro_names.iter().enumerate().map(|(i, &name)| (Cow::Borrowed(name), std::iter::once((ScopeSet::default(), Binding::SyntaxTransformer(i))).collect())))
@@ -703,8 +708,14 @@ impl crate::Environment {
 
     pub fn new_variable(&self) -> usize {
         let binding = self.bound_id_counter.get();
-        self.bound_id_counter.set(binding + 1);
+        self.bound_id_counter.set(match binding {
+            MAX_VARIABLE_ID => 0,
+            _ => binding + 1,
+        });
         binding
+    }
+    pub fn reserved_variable(i: usize) -> usize {
+        MAX_VARIABLE_ID + i
     }
     fn new_scope(&self) -> usize {
         let scope = self.scope_counter.get();
@@ -770,6 +781,7 @@ impl crate::Environment {
                 _ => unreachable!(),
             };
             if patterns.len() == templates.len() {
+                eprintln!("macro {}: rules={:#?}", name, std::iter::zip(patterns.iter().cloned(), templates.iter().cloned()).collect::<Vec<_>>());
                 Ok(Some((name, patterns, templates)))
             } else {
                 Err(Error::BadSyntax(stx))
@@ -1346,19 +1358,19 @@ impl crate::Environment {
                             .skip(1)
                             .map(|stx| self.resolve_syntax(stx))
                             .collect::<Result<Vec<_>, _>>()? }),
-                    Some(Binding::CoreForm(CoreForm::SetBang)) => Ok(Expression::Assignment {
+                    Some(Binding::CoreForm(CoreForm::SetValues)) => Ok(Expression::Assignment {
                         id: match stx.children.get(1).map(|c| &c.e) {
                             Some(Datum::Symbol(_)) => match self.resolve(&stx.children[1])? {
                                 Some(Binding::Variable(i)) => Box::new(Expression::Variable(i)),
-                                Some(_) => return Err(Error::BadCoreFormSyntax(CoreForm::SetBang, stx.children[1].clone())),
+                                Some(_) => return Err(Error::BadCoreFormSyntax(CoreForm::SetValues, stx.children[1].clone())),
                                 None => return Err(Error::UnboundIdentifier(stx.children[1].clone())),
                             },
-                            Some(_) => return Err(Error::BadCoreFormSyntax(CoreForm::SetBang, stx.children[1].clone())),
-                            None => return Err(Error::BadCoreFormSyntax(CoreForm::SetBang, stx.clone())),
+                            Some(_) => return Err(Error::BadCoreFormSyntax(CoreForm::SetValues, stx.children[1].clone())),
+                            None => return Err(Error::BadCoreFormSyntax(CoreForm::SetValues, stx.clone())),
                         },
                         value: Box::new(stx.children.get(2)
                             .map(|stx| self.resolve_syntax(stx))
-                            .ok_or_else(|| Error::BadCoreFormSyntax(CoreForm::SetBang, stx.clone()))??),
+                            .ok_or_else(|| Error::BadCoreFormSyntax(CoreForm::SetValues, stx.clone()))??),
                     }),
                     Some(Binding::CoreForm(CoreForm::Quote)) => match stx.children.get(1) {
                         None => return Err(Error::BadCoreFormSyntax(CoreForm::Quote, stx.clone())),
@@ -2214,7 +2226,7 @@ pub fn expand(stx: SyntaxObject, env: &mut Environment) -> Result<Expression, Er
 /******** built-in macros ********/
 fn build_core_macros() -> (Vec<&'static str>, Vec<Rules>) {
     [
-        ("and", [
+        ("and", vec![
             (
                 Pattern::List(vec![Pattern::Literal(Cow::Borrowed("and"))]),
                 Template::Constant(CORE_INTRODUCED_SYNTAXES.with(|c| LazyCell::force(c).get("#true").unwrap().clone()))
@@ -2226,15 +2238,60 @@ fn build_core_macros() -> (Vec<&'static str>, Vec<Rules>) {
             (
                 Pattern::List(vec![Pattern::Literal(Cow::Borrowed("and")), Pattern::Variable(Cow::Borrowed("test1")), Pattern::Ellipsis(Box::new(Pattern::Variable(Cow::Borrowed("test2"))))]),
                 Template::List(vec![
-                    Template::Constant(CORE_INTRODUCED_SYNTAXES.with(|c| LazyCell::force(c).get("if").unwrap().clone())),
+                    Template::Identifier(Cow::Borrowed("if")),
                     Template::Identifier(Cow::Borrowed("test1")),
                     Template::List(vec![
-                        Template::Constant(CORE_INTRODUCED_SYNTAXES.with(|c| LazyCell::force(c).get("and").unwrap().clone())),
+                        Template::Identifier(Cow::Borrowed("and")),
                         Template::Ellipsis(Box::new(Template::Identifier(Cow::Borrowed("test2")))),
                     ]),
                     Template::Constant(CORE_INTRODUCED_SYNTAXES.with(|c| LazyCell::force(c).get("#false").unwrap().clone())),
                 ]),
             ),
-        ].into_iter().collect()),
+        ]),
+        ("or", vec![
+            (
+                Pattern::List(vec![Pattern::Literal(Cow::Borrowed("or"))]),
+                Template::Constant(CORE_INTRODUCED_SYNTAXES.with(|c| LazyCell::force(c).get("#false").unwrap().clone()))
+            ),
+            (
+                Pattern::List(vec![Pattern::Literal(Cow::Borrowed("or")), Pattern::Variable(Cow::Borrowed("test"))]),
+                Template::Identifier(Cow::Borrowed("test")),
+            ),
+            (
+                Pattern::List(vec![Pattern::Literal(Cow::Borrowed("or")), Pattern::Variable(Cow::Borrowed("test1")), Pattern::Ellipsis(Box::new(Pattern::Variable(Cow::Borrowed("test2"))))]),
+                Template::List(vec![
+                    Template::Identifier(Cow::Borrowed("let")),
+                    Template::List(vec![Template::List(vec![Template::Identifier(Cow::Borrowed("x")), Template::Identifier(Cow::Borrowed("test1"))])]),
+                    Template::List(vec![
+                        Template::Identifier(Cow::Borrowed("if")),
+                        Template::Identifier(Cow::Borrowed("x")),
+                        Template::Identifier(Cow::Borrowed("x")),
+                        Template::List(vec![
+                            Template::Identifier(Cow::Borrowed("or")),
+                            Template::Ellipsis(Box::new(Template::Identifier(Cow::Borrowed("test2")))),
+                        ]),
+                    ]),
+                ]),
+            ),
+        ]),
+        ("let", vec![
+            (
+                Pattern::List(vec![
+                    Pattern::Literal(Cow::Borrowed("let")),
+                    Pattern::List(vec![Pattern::Ellipsis(Box::new(Pattern::List(vec![Pattern::Variable(Cow::Borrowed("name")), Pattern::Variable(Cow::Borrowed("val"))])))]),
+                    Pattern::Variable(Cow::Borrowed("body1")),
+                    Pattern::Ellipsis(Box::new(Pattern::Variable(Cow::Borrowed("body2")))),
+                ]),
+                Template::List(vec![
+                    Template::List(vec![
+                        Template::Identifier(Cow::Borrowed("lambda")),
+                        Template::List(vec![Template::Ellipsis(Box::new(Template::Identifier(Cow::Borrowed("name"))))]),
+                        Template::Identifier(Cow::Borrowed("body1")),
+                        Template::Ellipsis(Box::new(Template::Identifier(Cow::Borrowed("body2")))),
+                    ]),
+                    Template::Ellipsis(Box::new(Template::Identifier(Cow::Borrowed("val")))),
+                ]),
+            )
+        ]),
     ].into_iter().collect()
 }
