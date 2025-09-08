@@ -1,7 +1,7 @@
 use crate::syntax;
 use crate::syntax::{LiteralC, LiteralD};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)] pub struct ValueID(pub usize);
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)] pub struct ValueID(pub usize);
 impl From<&syntax::Expression> for ValueID {
     fn from(e: &syntax::Expression) -> Self {
         match e {
@@ -25,6 +25,8 @@ pub enum Atom {
 pub struct Lambda {
     /// The defined parameters of this function.
     formals: (Vec<ValueID>, Option<ValueID>),
+    /// Variables that need to be captured as part of the closure's environment.
+    closed_env: Vec<ValueID>,
     /// An additional parameter: the continuation to invoke with the return value.
     k: ContinuationID,
     body: Box<Expression>,
@@ -48,8 +50,7 @@ pub enum Expression {
     LetContinuation { var: ContinuationID, k: Continuation, body: Box<Expression> },
     /// Calls the lambda or primitive identified by `operator` with parameters identified by `operands`.
     /// Invokes the continuation `k` with the appropriate return values upon success.
-    /// Invokes the continuation `kf` on an exception.
-    Apply { operator: Atom, operands: (Vec<Atom>, Option<Atom>), k: ContinuationID },
+    Apply { operator: Atom, operands: (Vec<Atom>, Option<Atom>), k: Continuation },
     /// Identical to `consequent` unless `test` evaluates to false; then, `alternate`.
     Branch { test: Atom, consequent: Box<Expression>, alternate: Box<Expression> },
     /// Invokes `k` with `values`.
@@ -195,6 +196,7 @@ impl Expression {
                 var,
                 val: Lambda {
                     formals: val.formals,
+                    closed_env: val.closed_env,
                     k: val.k,
                     body: Box::new(val.body.rename(from, to)),
                 },
@@ -241,6 +243,7 @@ impl Expression {
                 var,
                 val: Lambda {
                     formals: val.formals,
+                    closed_env: val.closed_env,
                     k: if val.k == from { to } else { val.k },
                     body: Box::new(val.body.rename_continues(from, to)),
                 },
@@ -254,7 +257,10 @@ impl Expression {
             Apply { operator, operands, k } => Apply {
                 operator: map_atom(operator),
                 operands: (operands.0.into_iter().map(map_atom).collect(), operands.1.map(map_atom)),
-                k: if k == from { to } else { k },
+                k: match k {
+                    Continuation::Variable(i) if i == from => Continuation::Variable(to),
+                    _ => k,
+                },
             },
             Branch { test, consequent, alternate } => Branch {
                 test, // if test is Atom::Continuation, this will already have been optimized out
@@ -294,12 +300,74 @@ impl Expression {
             LetLiteral { body, .. } => body.uses_continuation(v),
             LetLambda { val, body, .. } => val.uses_continuation(v) || body.uses_continuation(v),
             LetContinuation { var, k, body } => *var == v || k.uses_continuation(v) || body.uses_continuation(v),
-            Apply { operator, operands, k } => *operator == Atom::Continuation(v) || operands.0.iter().chain(operands.1.iter()).any(|i| *i == Atom::Continuation(v)) || *k == v,
+            Apply { operator, operands, k } => *operator == Atom::Continuation(v) || operands.0.iter().chain(operands.1.iter()).any(|i| *i == Atom::Continuation(v)) || k.uses_continuation(v),
             Branch { test, consequent, alternate } => *test == Atom::Continuation(v) || consequent.uses_continuation(v) || alternate.uses_continuation(v),
             Continue { k, values } => k.uses_continuation(v) || values.0.iter().chain(values.1.iter()).any(|i| *i == Atom::Continuation(v)),
             Assign { values, k, .. } => values.0.iter().chain(values.1.iter()).any(|i| *i == Atom::Continuation(v)) || k.uses_continuation(v),
             Halt => false,
         }
+    }
+
+    pub fn variables(&self) -> std::collections::BTreeSet<ValueID> {
+        let atom2var = |atom: &Atom| if let Atom::Variable(i) = atom { Some(*i) } else { None };
+        let mut uses = std::collections::BTreeSet::new();
+        let mut intros = std::collections::BTreeSet::new();
+        let mut queue = std::iter::once(self).collect::<std::collections::VecDeque<_>>();
+        while let Some(e) = queue.pop_front() {
+            match e {
+                Expression::LetLiteral { var, body, .. } => {
+                    intros.insert(*var);
+                    queue.push_back(body.as_ref());
+                },
+                Expression::LetLambda { var, val, body } => {
+                    intros.insert(*var);
+                    intros.extend(val.formals.0.iter().chain(val.formals.1.iter()));
+                    queue.push_back(body.as_ref());
+                },
+                Expression::LetContinuation { k, body, .. } => {
+                    if let Continuation::Implicit { formals, body } = k {
+                        intros.extend(formals.0.iter().chain(formals.1.iter()));
+                        queue.push_back(body.as_ref());
+                    }
+                    queue.push_back(body.as_ref());
+                },
+                Expression::Apply { operator, operands, k } => {
+                    uses.extend(std::iter::once(operator)
+                        .chain(operands.0.iter())
+                        .chain(operands.1.iter())
+                        .filter_map(atom2var));
+                    if let Continuation::Implicit { formals, body } = k {
+                        intros.extend(formals.0.iter().chain(formals.1.iter()));
+                        queue.push_back(body.as_ref());
+                    }
+                },
+                Expression::Branch { test, consequent, alternate } => {
+                    if let Atom::Variable(test) = test {
+                        uses.insert(*test);
+                    }
+                    queue.push_back(consequent.as_ref());
+                    queue.push_back(alternate.as_ref());
+                }
+                Expression::Continue { k, values } => {
+                    if let Continuation::Implicit { formals, body } = k {
+                        intros.extend(formals.0.iter().chain(formals.1.iter()));
+                        queue.push_back(body.as_ref());
+                    }
+                    uses.extend(values.0.iter().chain(values.1.iter()).filter_map(atom2var));
+                }
+                Expression::Assign { vars, values, k } => {
+                    intros.extend(vars.0.iter().chain(vars.1.iter())); // The value is being introduced to this variable here ...
+                    uses.extend(values.0.iter().chain(values.1.iter()).filter_map(atom2var));
+                    if let Continuation::Implicit { formals, body } = k {
+                        intros.extend(formals.0.iter().chain(formals.1.iter()));
+                        queue.push_back(body.as_ref());
+                    }
+                }
+                Expression::Halt => (),
+            }
+        }
+
+        uses.difference(&intros).copied().collect()
     }
 }
 
@@ -377,18 +445,23 @@ impl crate::Environment {
                     self.atomize_many(operands, move |operands| Expression::Apply {
                         operator,
                         operands: (operands, None),
-                        k,
+                        k: Continuation::Variable(k),
                     }))
             }
             syntax::Expression::Lambda { formals, body } => {
                 let x = ValueID(self.new_variable());
                 let kx = ContinuationID(self.new_variable());
+                let body = self.transform_block(body, kx);
+                let closed_env = body.variables()
+                    .difference(&formals.0.iter().chain(formals.1.iter().map(Box::as_ref)).map(ValueID::from).collect())
+                    .copied().collect();
                 Expression::LetLambda {
                     var: x,
                     val: Lambda {
-                        formals: (formals.0.iter().map(|e| ValueID::from(e)).collect(), formals.1.map(|e| ValueID::from(e.as_ref()))),
+                        formals: (formals.0.iter().map(ValueID::from).collect(), formals.1.map(|e| ValueID::from(e.as_ref()))),
+                        closed_env,
                         k: kx,
-                        body: Box::new(self.transform_block(body, kx)),
+                        body: Box::new(body),
                     },
                     body: Box::new(Expression::Continue {
                         k: Continuation::Variable(k),
@@ -479,9 +552,20 @@ impl crate::Environment {
                         if applications == 1 {
                             ret &= body.visit_mut(|e| match e {
                                 Apply { operator: Atom::Variable(operator), operands, k } if operator == var => {
-                                    *e = std::mem::take(val.body.as_mut())
-                                        .rename_continues(val.k, *k)
+                                    let mut xfm = |k: ContinuationID| std::mem::take(val.body.as_mut())
+                                        .rename_continues(val.k, k)
                                         .rename(&val.formals, &operands);
+                                    *e = match k {
+                                        Continuation::Variable(k) => xfm(*k),
+                                        _ => {
+                                            let k0 = ContinuationID(self.new_variable());
+                                            LetContinuation {
+                                                var: k0,
+                                                k: std::mem::take(k),
+                                                body: Box::new(xfm(k0)),
+                                            }
+                                        },
+                                    };
                                     false
                                 },
                                 _ => true,
@@ -537,7 +621,7 @@ impl crate::Environment {
                                     *e = Apply {
                                         operator: operands.0.first().copied().unwrap(),
                                         operands: (operands.0.iter().skip(1).copied().collect(), operands.1),
-                                        k: *k,
+                                        k: std::mem::take(k),
                                     };
                                 } else {
                                     let x0 = ValueID(self.new_variable());
@@ -548,7 +632,7 @@ impl crate::Environment {
                                             body: Box::new(Apply {
                                                 operator: Atom::Variable(x0),
                                                 operands: (vec![], Some(Atom::Variable(x1))),
-                                                k: *k,
+                                                k: std::mem::take(k),
                                             }),
                                         },
                                         values: std::mem::take(operands),
@@ -557,22 +641,34 @@ impl crate::Environment {
                                 false
                             },
                             Atom::CorePrimitive("call/cc" | "call-with-current-continuation") => {
-                                if operands.0.len() >= 1 {
-                                    *e = Apply {
-                                        operator: operands.0.first().copied().unwrap(),
+                                let mut ccc = |operands: &[Atom]| match k {
+                                    Continuation::Variable(k) => Apply {
+                                        operator: operands[0],
                                         operands: (vec![Atom::Continuation(*k)], None),
-                                        k: *k,
-                                    };
+                                        k: Continuation::Variable(*k),
+                                    },
+                                    _ => {
+                                        let k0 = ContinuationID(self.new_variable());
+                                        LetContinuation {
+                                            var: k0,
+                                            k: std::mem::take(k),
+                                            body: Box::new(Apply {
+                                                operator: operands[0],
+                                                operands: (vec![Atom::Continuation(k0)], None),
+                                                k: Continuation::Variable(k0),
+                                            }),
+                                        }
+                                    },
+                                };
+                                if operands.0.len() >= 1 {
+                                    *e = ccc(&operands.0);
                                 } else {
                                     let x0 = ValueID(self.new_variable());
+                                    let body = ccc(&vec![Atom::Variable(x0)]);
                                     *e = Continue {
                                         k: Continuation::Implicit {
                                             formals: (vec![x0], None),
-                                            body: Box::new(Apply {
-                                                operator: Atom::Variable(x0),
-                                                operands: (vec![Atom::Continuation(*k)], None),
-                                                k: *k,
-                                            }),
+                                            body: Box::new(body),
                                         },
                                         values: std::mem::take(operands),
                                     };
@@ -581,22 +677,17 @@ impl crate::Environment {
                             },
                             Atom::CorePrimitive("call-with-values") => {
                                 let x0 = ValueID(self.new_variable());
-                                let k0 = ContinuationID(self.new_variable());
-                                let cwv = |operands: &[Atom]| LetContinuation {
-                                    var: k0,
+                                let mut cwv = |operands: &[Atom]| Apply {
+                                    operator: operands[0],
+                                    operands: (vec![], None),
                                     k: Continuation::Implicit {
                                         formals: (vec![], Some(x0)),
                                         body: Box::new(Apply {
                                             operator: operands[1],
                                             operands: (vec![], Some(Atom::Variable(x0))),
-                                            k: *k,
+                                            k: std::mem::take(k),
                                         }),
                                     },
-                                    body: Box::new(Apply {
-                                        operator: operands[0],
-                                        operands: (vec![], None),
-                                        k: k0,
-                                    }),
                                 };
                                 if operands.0.len() >= 2 {
                                     *e = cwv(&operands.0);
@@ -613,34 +704,24 @@ impl crate::Environment {
                                 false
                             },
                             Atom::CorePrimitive("dynamic-wind") => {
-                                let k0 = ContinuationID(self.new_variable());
-                                let k1 = ContinuationID(self.new_variable());
-                                let dw = |operands: &[Atom]| LetContinuation {
-                                    var: k0,
+                                let mut dw = |operands: &[Atom]| Apply {
+                                    operator: operands[0],
+                                    operands: (vec![], None),
                                     k: Continuation::Implicit {
                                         formals: (vec![], None),
                                         body: Box::new(Apply {
-                                            operator: operands[0],
-                                            operands: (vec![], None),
-                                            k: *k,
-                                        })
-                                    },
-                                    body: Box::new(LetContinuation {
-                                        var: k1,
-                                        k: Continuation::Implicit {
-                                            formals: (vec![], None),
-                                            body: Box::new(Apply {
-                                                operator: Atom::CorePrimitive("__push_dynamic_frame"),
-                                                operands: (vec![operands[0], operands[2]], None),
-                                                k: k0,
-                                            }),
-                                        },
-                                        body: Box::new(Apply {
-                                            operator: operands[0],
-                                            operands: (vec![], None),
-                                            k: k1,
+                                            operator: Atom::CorePrimitive("__push_dynamic_frame"),
+                                            operands: (vec![operands[0], operands[2]], None),
+                                            k: Continuation::Implicit {
+                                                formals: (vec![], None),
+                                                body: Box::new(Apply {
+                                                    operator: operands[0],
+                                                    operands: (vec![], None),
+                                                    k: std::mem::take(k),
+                                                })
+                                            },
                                         }),
-                                    }),
+                                    },
                                 };
 
                                 if operands.0.len() >= 3 {
@@ -659,16 +740,16 @@ impl crate::Environment {
                             },
                             Atom::CorePrimitive("values") => {
                                 *e = Continue {
-                                    k: Continuation::Variable(*k),
+                                    k: std::mem::take(k),
                                     values: std::mem::take(operands),
                                 };
                                 false
                             },
                             Atom::CorePrimitive("raise" | "raise-continuable") => {
-                                let k0 = ContinuationID(self.new_variable());
                                 let eh = ValueID(self.new_variable());
-                                let raise = |continuable| LetContinuation {
-                                    var: k0,
+                                let mut raise = |continuable| Apply {
+                                    operator: Atom::CorePrimitive("__peek_exception_handler"),
+                                    operands: (vec![], None),
                                     k: Continuation::Implicit {
                                         formals: (vec![eh], None),
                                         body: Box::new(Apply {
@@ -677,15 +758,11 @@ impl crate::Environment {
                                                 Some(o) => vec![*o],
                                                 None => vec![],
                                             }, None),
-                                            k: if continuable { *k } else { ContinuationID(Self::reserved_variable(1)) },
-                                        }),
+                                            k: if continuable { std::mem::take(k) } else { Continuation::Abort },
+                                        })
                                     },
-                                    body: Box::new(Apply {
-                                        operator: Atom::CorePrimitive("__peek_exception_handler"),
-                                        operands: (vec![], None),
-                                        k: k0,
-                                    }),
                                 };
+
                                 *e = match operator {
                                     Atom::CorePrimitive("raise") => raise(false),
                                     Atom::CorePrimitive("raise-continuable") => raise(true),
@@ -694,34 +771,24 @@ impl crate::Environment {
                                 false
                             },
                             Atom::CorePrimitive("with-exception-handler") => {
-                                let k0 = ContinuationID(self.new_variable());
-                                let k1 = ContinuationID(self.new_variable());
-                                let weh = |operands: &[Atom]| LetContinuation {
-                                    var: k0,
+                                let mut weh = |operands: &[Atom]| Apply {
+                                    operator: Atom::CorePrimitive("__push_exception_handler"),
+                                    operands: (vec![operands[0]], None),
                                     k: Continuation::Implicit {
                                         formals: (vec![], None),
                                         body: Box::new(Apply {
-                                            operator: Atom::CorePrimitive("__pop_exception_handler"),
-                                            operands: (vec![operands[0]], None),
-                                            k: *k,
+                                            operator: operands[1],
+                                            operands: (vec![], None),
+                                            k: Continuation::Implicit {
+                                                formals: (vec![], None),
+                                                body: Box::new(Apply {
+                                                    operator: Atom::CorePrimitive("__pop_exception_handler"),
+                                                    operands: (vec![operands[0]], None),
+                                                    k: std::mem::take(k),
+                                                }),
+                                            },
                                         }),
                                     },
-                                    body: Box::new(LetContinuation {
-                                        var: k1,
-                                        k: Continuation::Implicit {
-                                            formals: (vec![], None),
-                                            body: Box::new(Apply {
-                                                operator: operands[1],
-                                                operands: (vec![], None),
-                                                k: k0,
-                                            }),
-                                        },
-                                        body: Box::new(Apply {
-                                            operator: Atom::CorePrimitive("__push_exception_handler"),
-                                            operands: (vec![operands[0]], None),
-                                            k: k1,
-                                        }),
-                                    }),
                                 };
 
                                 if operands.0.len() >= 2 {
