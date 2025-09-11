@@ -30,6 +30,23 @@ fn main() {
 
         let k_dummy = cps::ContinuationID(usize::MAX);
         let se = cps::transform(se, k_dummy, &e_env);
-        println!("final form: {:?}", se);
+        if let cps::Expression::Apply { operator, .. } = se {
+            match operator {
+                cps::Atom::CorePrimitive("__library_export") => {
+                    for (name, bindings) in e_env.bindings.iter() {
+                        match bindings.get(&Default::default()) {
+                            Some(syntax::Binding::SyntaxTransformer(i)) => {
+                                println!("(define-syntax {} {})", name, e_env.macros[*i]);
+                            },
+                            _ => (),
+                        }
+                    }
+
+                },
+                _ => println!("final form: {:?}", se),
+            };
+        } else {
+            println!("final form: {:?}", se);
+        }
     }
 }

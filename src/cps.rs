@@ -715,7 +715,7 @@ impl crate::Environment {
                                             k: Continuation::Implicit {
                                                 formals: (vec![], None),
                                                 body: Box::new(Apply {
-                                                    operator: operands[0],
+                                                    operator: operands[1],
                                                     operands: (vec![], None),
                                                     k: std::mem::take(k),
                                                 })
