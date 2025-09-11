@@ -11,9 +11,19 @@ pub struct Environment {
 }
 
 fn main() {
+    let mut e_env = Environment::new();
+    for (name, bindings) in e_env.bindings.iter() {
+        match bindings.get(&Default::default()) {
+            Some(syntax::Binding::SyntaxTransformer(i)) => {
+                println!("(define-syntax {} {})", name, e_env.macros[*i]);
+            },
+            _ => (),
+        }
+    }
+
     let mut stdin = std::io::stdin().lock();
     let mut handle = io::InputPort::try_from(&mut stdin as &mut dyn std::io::Read).unwrap();
-    let mut e_env = Environment::new();
+
     loop {
         let stx = match syntax::read(&mut handle) {
             Ok(stx) => stx,

@@ -40,6 +40,14 @@ pub enum Literal {
 }
 impl From<LiteralC> for Literal { fn from(x: LiteralC) -> Self { Self::Copy(x) } }
 impl From<LiteralD> for Literal { fn from(x: LiteralD) -> Self { Self::Clone(x) } }
+impl std::fmt::Display for Literal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Literal::Copy(lc) => write!(f, "{}", lc),
+            Literal::Clone(ld) => write!(f, "{}", ld),
+        }
+    }
+}
 
 #[derive(Debug, Clone, Copy)]
 pub enum LiteralC {
@@ -66,6 +74,20 @@ impl PartialEq for LiteralC {
 }
 impl Eq for LiteralC {
 }
+impl std::fmt::Display for LiteralC {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            LiteralC::Nil => write!(f, "()"),
+            LiteralC::Boolean(true) => write!(f, "#t"),
+            LiteralC::Boolean(false) => write!(f, "#f"),
+            LiteralC::Integer(i) => write!(f, "{}", i),
+            LiteralC::Rational(n, d) => write!(f, "{}/{}", n, d),
+            LiteralC::Float(x) => write!(f, "{}", x),
+            LiteralC::Character(c) => write!(f, "#\\{}", c),
+            LiteralC::Symbol(s) => write!(f, "{}", s),
+        }
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum LiteralD {
@@ -74,6 +96,40 @@ pub enum LiteralD {
     Symbol(String),
     List(Vec<Literal>, Option<Box<Literal>>),
     Vector(Vec<Literal>),
+}
+impl std::fmt::Display for LiteralD {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            LiteralD::String(s) => write!(f, "{:?}", s),
+            LiteralD::Bytes(items) => {
+                write!(f, "#u8(")?;
+                for (i, x) in items.iter().enumerate() {
+                    write!(f, "{}{}", x, if i + 1 == items.len() { ')' } else { ' ' })?;
+                }
+                Ok(())
+            }
+            LiteralD::Symbol(s) => write!(f, "{}", s),
+            LiteralD::List(literals, tail) => {
+                write!(f, "(")?;
+                for (i, l) in literals.iter().enumerate() {
+                    if i == 0 { write!(f, "{}", l)?; }
+                    else { write!(f, " {}", l)?; }
+                }
+                match tail {
+                    None => write!(f, ")"),
+                    Some(tail) => write!(f, " . {})", tail),
+                }
+            }
+            LiteralD::Vector(literals) => {
+                write!(f, "(")?;
+                for (i, l) in literals.iter().enumerate() {
+                    if i == 0 { write!(f, "{}", l)?; }
+                    else { write!(f, " {}", l)?; }
+                }
+                write!(f, ")")
+            }
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -112,7 +168,8 @@ pub enum Binding {
     Variable(usize),
 }
 
-pub type Rules = Vec<(Pattern, Template)>;
+#[derive(Debug, Clone)]
+pub struct Rules(pub Vec<(Pattern, Template)>);
 
 #[derive(Debug, Clone)]
 pub enum Pattern {
@@ -328,10 +385,10 @@ impl std::fmt::Display for SyntaxObject {
             Datum::Integer(i) => write!(f, "{}", i),
             Datum::Rational(n, d) => write!(f, "{}/{}", n, d),
             Datum::Float(fl) => write!(f, "{}", fl),
-            Datum::Character(c) => write!(f, "\\#{}", c),
+            Datum::Character(c) => write!(f, "#\\{}", c),
             Datum::String(s) => write!(f, "\"{}\"", s),
             Datum::Bytes(b) => write!(f, "{:?}", b),
-            Datum::Symbol(s) => write!(f, "{}:{:?}", s, self.scopes),
+            Datum::Symbol(s) => write!(f, "{}", s),
             Datum::Quote => write!(f, "'{}", self.children[0]),
             Datum::Quasiquote => write!(f, "`{}", self.children[0]),
             Datum::Unquote => write!(f, ",{}", self.children[0]),
@@ -339,34 +396,26 @@ impl std::fmt::Display for SyntaxObject {
             Datum::List => {
                 write!(f, "(")?;
                 for (i, child) in self.children.iter().enumerate() {
-                    write!(f, "{}", child)?;
-                    if i < self.children.len() - 1 {
-                        write!(f, " ")?;
-                    }
+                    write!(f, "{}{}", child, if i + 1 == self.children.len() { ')' } else { ' ' })?;
                 }
-                write!(f, ")")
+                Ok(())
             },
             Datum::ImproperList => {
                 write!(f, "(")?;
                 for (i, child) in self.children.iter().enumerate() {
-                    write!(f, "{}", child)?;
-                    if i < self.children.len() - 2 {
-                        write!(f, " ")?;
-                    } else if i == self.children.len() - 1 {
-                        write!(f, " . ")?;
-                    }
+                    match self.children.len() - i {
+                        1 => write!(f, ". {})", child),
+                        _ => write!(f, "{} ", child),
+                    }?;
                 }
-                write!(f, ")")
+                Ok(())
             },
             Datum::Vector => {
                 write!(f, "#(")?;
                 for (i, child) in self.children.iter().enumerate() {
-                    write!(f, "{}", child)?;
-                    if i < self.children.len() - 1 {
-                        write!(f, " ")?;
-                    }
+                    write!(f, "{}{}", child, if i + 1 == self.children.len() { ')' } else { ' ' })?;
                 }
-                write!(f, ")")
+                Ok(())
             },
         }
     }
@@ -550,6 +599,59 @@ impl<'a> Pattern {
             Datum::Quote | Datum::Quasiquote | Datum::Unquote | Datum::UnquoteSplicing => Err(()),
         }
     }
+
+    fn literals(&'a self) -> std::collections::HashSet<&'a str> {
+        let mut literals = std::collections::HashSet::new();
+        let mut queue = std::collections::VecDeque::new();
+        queue.push_back(self);
+        while let Some(pattern) = queue.pop_front() {
+            match pattern {
+                Pattern::Literal(Cow::Borrowed(s)) => { literals.insert(*s); },
+                Pattern::Literal(Cow::Owned(s)) => { literals.insert(s.as_str()); },
+                Pattern::List(patterns) => queue.extend(patterns),
+                Pattern::ImproperList(patterns, tail) => {
+                    queue.extend(patterns);
+                    queue.push_back(tail);
+                }
+                Pattern::Vector(patterns) => queue.extend(patterns),
+                Pattern::Ellipsis(pattern) => queue.push_back(pattern),
+                _ => (),
+            }
+        }
+        literals
+    }
+}
+impl std::fmt::Display for Pattern {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Pattern::Underscore => write!(f, "_"),
+            Pattern::Literal(s) => write!(f, "{}", s),
+            Pattern::Variable(s) => write!(f, "{}", s),
+            Pattern::Ellipsis(pattern) => write!(f, "{} ...", pattern),
+            Pattern::Constant(literal) => write!(f, "{}", literal),
+            Pattern::List(patterns) => {
+                write!(f, "(")?;
+                for (i, p) in patterns.iter().enumerate() {
+                    write!(f, "{}{}", p, if i + 1 == patterns.len() { ')' } else { ' ' })?;
+                }
+                Ok(())
+            },
+            Pattern::ImproperList(patterns, tail) => {
+                write!(f, "(")?;
+                for p in patterns {
+                    write!(f, "{} ", p)?;
+                }
+                write!(f, ". {})", tail)
+            }
+            Pattern::Vector(patterns) => {
+                write!(f, "#(")?;
+                for (i, p) in patterns.iter().enumerate() {
+                    write!(f, "{}{}", p, if i + 1 == patterns.len() { ')' } else { ' ' })?;
+                }
+                Ok(())
+            },
+        }
+    }
 }
 
 impl Template {
@@ -685,6 +787,60 @@ impl Template {
         }
     }
 }
+impl std::fmt::Display for Template {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Template::Constant(stx) => write!(f, "{}", stx),
+            Template::Identifier(s) => write!(f, "{}", s),
+            Template::Ellipsis(template) => write!(f, "{} ...", template),
+            Template::List(templates) => {
+                write!(f, "(")?;
+                for (i, p) in templates.iter().enumerate() {
+                    write!(f, "{}{}", p, if i + 1 == templates.len() { ')' } else { ' ' })?;
+                }
+                Ok(())
+            },
+            Template::ImproperList(templates, tail) => {
+                write!(f, "(")?;
+                for p in templates {
+                    write!(f, "{} ", p)?;
+                }
+                write!(f, ". {})", tail)
+            }
+            Template::Vector(templates) => {
+                write!(f, "#(")?;
+                for (i, p) in templates.iter().enumerate() {
+                    write!(f, "{}{}", p, if i + 1 == templates.len() { ')' } else { ' ' })?;
+                }
+                Ok(())
+            },
+        }
+    }
+}
+
+impl Rules {
+    fn from<P: IntoIterator<Item = Pattern>, T: IntoIterator<Item = Template>>(patterns: P, templates: T) -> Self {
+        Self(std::iter::zip(patterns, templates).collect())
+    }
+}
+impl std::fmt::Display for Rules {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let mut literals = std::collections::HashSet::new();
+        for (pattern, _) in self.0.iter() {
+            literals.extend(pattern.literals());
+        }
+
+        write!(f, "(syntax-rules (")?;
+        for (i, t) in literals.iter().enumerate() {
+            write!(f, "{}{}", t, if i + 1 == literals.len() { ')' } else { ' ' })?;
+        }
+        write!(f, "\n")?;
+        for (i, (pattern, template)) in self.0.iter().enumerate() {
+            write!(f, " ({}\n  {}){}", pattern, template, if i + 1 == self.0.len() { ")" } else { "\n" })?;
+        }
+        Ok(())
+    }
+}
 
 impl crate::Environment {
     pub fn new() -> Self {
@@ -778,15 +934,6 @@ impl crate::Environment {
             Ok(None)
         }
     }
-    fn define_early(&mut self, stx: Rc<SyntaxObject>) -> Result<Rc<SyntaxObject>, Error> {
-        if let Some((name, patterns, templates)) = Self::parse_syntax_definition(stx.clone())? {
-            self.bindings.insert(name, std::iter::once((ScopeSet::default(), Binding::SyntaxTransformer(self.macros.len()))).collect());
-            self.macros.push_back(std::iter::zip(patterns, templates).collect());
-            Ok(Rc::new(SyntaxObject::simple(Datum::Boolean(true), stx.source_location)))
-        } else {
-            Ok(stx)
-        }
-    }
 
     fn expand_qq_syntax(&self, mut stx: Rc<SyntaxObject>, qq_depth: usize) -> Result<(Rc<SyntaxObject>, bool), Error> {
         if qq_depth == 0 {
@@ -843,7 +990,7 @@ impl crate::Environment {
                 Some(head) => self.resolve(head)?,
             };
             if let Some(Binding::SyntaxTransformer(index)) = head {
-                return self.macros.get(index).unwrap().iter()
+                return self.macros.get(index).unwrap().0.iter()
                     .find_map(|(pattern, template)| pattern.try_match(&stx).map(|e| (e, template)))
                     .map(|(env, template)| {
                         let slice = env.iter().map(|(k, v)| (*k, v)).collect();
@@ -966,7 +1113,7 @@ impl crate::Environment {
                 Some(bb) => bb.insert(stx.scopes.clone(), Binding::SyntaxTransformer(self.macros.len())).map(|_| ()),
                 None => self.bindings.insert(name, std::iter::once((stx.scopes.clone(), Binding::SyntaxTransformer(self.macros.len()))).collect()).map(|_| ()),
             };
-            self.macros.push_back(std::iter::zip(patterns, templates).collect());
+            self.macros.push_back(Rules::from(patterns, templates));
             Ok(Rc::new(SyntaxObject::simple(Datum::Boolean(true), stx.source_location)))
         } else if let Some(matches) = VALUE_DEFINITION_PATTERN.try_match(&stx) {
             match matches.get("formals") {
@@ -1022,7 +1169,7 @@ impl crate::Environment {
                 }).collect::<Result<Vec<_>, Error>>()?,
                 _ => unreachable!(),
             };
-            let patterns = match matches.get("pattern") {
+            let patternses = match matches.get("pattern") {
                 Some(MatchValue::Many(vs)) => vs.iter().enumerate().map(|(i, v)| match v {
                     MatchValue::Many(vs) => vs.iter().map(|v| match v {
                         MatchValue::One(pattern_stx) => Pattern::from(pattern_stx, &literals[i]).map_err(|_| Error::BadSyntax(pattern_stx.clone())),
@@ -1032,7 +1179,7 @@ impl crate::Environment {
                 }).collect::<Result<Vec<_>, Error>>()?,
                 _ => unreachable!(),
             };
-            let templates = match matches.get("template") {
+            let templateses = match matches.get("template") {
                 Some(MatchValue::Many(vs)) => vs.iter().map(|v| match v {
                     MatchValue::Many(vs) => vs.iter().map(|v| match v {
                         MatchValue::One(template_stx) => Template::from(template_stx).map_err(|_| Error::BadSyntax(template_stx.clone())),
@@ -1042,11 +1189,11 @@ impl crate::Environment {
                 }).collect::<Result<Vec<_>, Error>>()?,
                 _ => unreachable!(),
             };
-            if names.len() != patterns.len() || patterns.len() != templates.len() || names.len() != templates.len() {
+            if names.len() != patternses.len() || patternses.len() != templateses.len() || names.len() != templateses.len() {
                 return Err(Error::BadSyntax(stx));
             }
-            for (p, t) in std::iter::zip(patterns, templates) {
-                self.macros.push_back(std::iter::zip(p, t).collect());
+            for (patterns, templates) in std::iter::zip(patternses, templateses) {
+                self.macros.push_back(Rules::from(patterns, templates));
             }
 
             let mut bodys = vec![CORE_INTRODUCED_SYNTAXES.with(|c| LazyCell::force(c).get("begin").unwrap().clone())];
@@ -2202,19 +2349,16 @@ fn radix(port: &mut InputPort, offset: usize, base: i32) -> Result<Option<usize>
 /******** expander ********/
 pub fn expand(stx: SyntaxObject, env: &mut Environment) -> Result<Expression, Error> {
     eprintln!("step1: {}", stx);
-    let stx = env.define_early(Rc::new(stx))?;
+    let stx = env.define_inner(Rc::new(stx))?;
     let stx = env.expand_and_scope(stx)?;
-    eprintln!("step2: {}", stx);
-    let stx = env.define_inner(stx)?;
-    let stx = env.expand_and_scope(stx)?;
-    eprintln!("step3: {}", stx);
+    eprintln!("expanded: {}", stx);
     env.resolve_syntax(&stx)
 }
 
 /******** built-in macros ********/
 fn build_core_macros() -> (Vec<&'static str>, Vec<Rules>) {
     [
-        ("and", [
+        ("and", Rules(vec![
             (
                 Pattern::List(vec![Pattern::Literal(Cow::Borrowed("and"))]),
                 Template::Constant(CORE_INTRODUCED_SYNTAXES.with(|c| LazyCell::force(c).get("#true").unwrap().clone()))
@@ -2235,6 +2379,51 @@ fn build_core_macros() -> (Vec<&'static str>, Vec<Rules>) {
                     Template::Constant(CORE_INTRODUCED_SYNTAXES.with(|c| LazyCell::force(c).get("#false").unwrap().clone())),
                 ]),
             ),
-        ].into_iter().collect()),
+        ])),
+        ("or", Rules(vec![
+            (
+                Pattern::List(vec![Pattern::Literal(Cow::Borrowed("or"))]),
+                Template::Constant(CORE_INTRODUCED_SYNTAXES.with(|c| LazyCell::force(c).get("#false").unwrap().clone()))
+            ),
+            (
+                Pattern::List(vec![Pattern::Literal(Cow::Borrowed("or")), Pattern::Variable(Cow::Borrowed("test"))]),
+                Template::Identifier(Cow::Borrowed("test")),
+            ),
+            (
+                Pattern::List(vec![Pattern::Literal(Cow::Borrowed("or")), Pattern::Variable(Cow::Borrowed("test1")), Pattern::Ellipsis(Box::new(Pattern::Variable(Cow::Borrowed("test2"))))]),
+                Template::List(vec![
+                    Template::Identifier(Cow::Borrowed("let")),
+                    Template::List(vec![Template::List(vec![Template::Identifier(Cow::Borrowed("x")), Template::Identifier(Cow::Borrowed("test1"))])]),
+                    Template::List(vec![
+                        Template::Identifier(Cow::Borrowed("if")),
+                        Template::Identifier(Cow::Borrowed("x")),
+                        Template::Identifier(Cow::Borrowed("x")),
+                        Template::List(vec![
+                            Template::Identifier(Cow::Borrowed("or")),
+                            Template::Ellipsis(Box::new(Template::Identifier(Cow::Borrowed("test2")))),
+                        ]),
+                    ]),
+                ]),
+            ),
+        ])),
+        ("let", Rules(vec![
+            (
+                Pattern::List(vec![
+                    Pattern::Literal(Cow::Borrowed("let")),
+                    Pattern::List(vec![Pattern::Ellipsis(Box::new(Pattern::List(vec![Pattern::Variable(Cow::Borrowed("name")), Pattern::Variable(Cow::Borrowed("val"))])))]),
+                    Pattern::Variable(Cow::Borrowed("body1")),
+                    Pattern::Ellipsis(Box::new(Pattern::Variable(Cow::Borrowed("body2")))),
+                ]),
+                Template::List(vec![
+                    Template::List(vec![
+                        Template::Identifier(Cow::Borrowed("lambda")),
+                        Template::List(vec![Template::Ellipsis(Box::new(Template::Identifier(Cow::Borrowed("name"))))]),
+                        Template::Identifier(Cow::Borrowed("body1")),
+                        Template::Ellipsis(Box::new(Template::Identifier(Cow::Borrowed("body2")))),
+                    ]),
+                    Template::Ellipsis(Box::new(Template::Identifier(Cow::Borrowed("val")))),
+                ]),
+            )
+        ])),
     ].into_iter().collect()
 }
