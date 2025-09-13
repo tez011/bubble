@@ -28,6 +28,7 @@ fn main() {
             }
         };
 
+        eprintln!("resolved: {:?}", se);
         let k_dummy = cps::ContinuationID(usize::MAX);
         let se = cps::transform(se, k_dummy, &e_env);
         if let cps::Expression::Apply { operator, .. } = se {
@@ -43,10 +44,10 @@ fn main() {
                     }
 
                 },
-                _ => println!("final form: {:?}", se),
+                _ => println!("final form: {:#?}", se),
             };
         } else {
-            println!("final form: {:?}", se);
+            println!("final form: {:#?}", se);
         }
     }
 }

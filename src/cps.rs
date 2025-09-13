@@ -826,7 +826,5 @@ impl crate::Environment {
 }
 
 pub fn transform(e: syntax::Expression, k: ContinuationID, env: &crate::Environment) -> Expression {
-    let e = env.cps_transform(e, k);
-    eprintln!("step4: {:?}", e);
-    env.optimize_cps(e)
+    env.optimize_cps(env.cps_transform(e, k))
 }
