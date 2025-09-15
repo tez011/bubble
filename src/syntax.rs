@@ -2364,7 +2364,8 @@ fn radix(port: &mut InputPort, offset: usize, base: i32) -> Result<Option<usize>
 
 /******** expander ********/
 pub fn expand(stx: SyntaxObject, env: &mut Environment) -> Result<Expression, Error> {
-    let stx = env.define_inner(Rc::new(stx))?;
+    let stx = env.expand_and_scope(Rc::new(stx))?;
+    let stx = env.define_inner(stx)?;
     let stx = env.expand_and_scope(stx)?;
     eprintln!("expanded: {}", stx);
     env.resolve_syntax(&stx)
