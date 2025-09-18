@@ -14,30 +14,33 @@ pub struct Environment {
 fn main() {
     let mut stdin = std::io::stdin().lock();
     let mut handle = io::InputPort::try_from(&mut stdin as &mut dyn std::io::Read).unwrap();
-    let mut e_env = Environment::new();
+    let mut env = Environment::new();
     loop {
-        let stx = match syntax::read(&mut handle) {
-            Ok(stx) => stx,
-            Err(e) => { eprintln!("Parse error at {:?}: {}", handle.location(), e); continue; },
-        };
-        let se = match syntax::expand(stx, &mut e_env) {
-            Ok(se) => se,
+        let se = match syntax::read(&mut handle) {
+            Ok(stx) => match syntax::expand(stx, &mut env) {
+                Ok(se) => {
+                    eprintln!("resolved: {:?}", se);
+                    se
+                },
+                Err(e) => {
+                    eprintln!("expand error at {:?}: {}", handle.location(), e);
+                    continue;
+                },
+            },
             Err(e) => {
-                eprintln!("Expand error at {:?}: {}", handle.location(), e);
+                eprintln!("parse error at {:?}: {}", handle.location(), e);
                 continue;
-            }
+            },
         };
 
-        eprintln!("resolved: {:?}", se);
-        let k_dummy = cps::ContinuationID(usize::MAX);
-        let se = cps::transform(se, k_dummy, &e_env);
+        let se = cps::transform(se, cps::ContinuationID(0), &env);
         if let cps::Expression::Apply { operator, .. } = se {
             match operator {
                 cps::Atom::CorePrimitive("__library_export") => {
-                    for (name, bindings) in e_env.bindings.iter() {
+                    for (name, bindings) in env.bindings.iter() {
                         match bindings.get(&Default::default()) {
                             Some(syntax::Binding::SyntaxTransformer(i)) => {
-                                println!("(define-syntax {} {})", name, e_env.macros[*i]);
+                                println!("(define-syntax {} {})", name, env.macros[*i]);
                             },
                             _ => (),
                         }
