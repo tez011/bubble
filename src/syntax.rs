@@ -55,7 +55,7 @@ pub enum LiteralC {
     Boolean(bool),
     Integer(i64),
     Rational(i64, i64),
-    Float(f64),
+    Float(f32),
     Character(char),
     Symbol(&'static str),
 }
@@ -260,7 +260,7 @@ enum Datum {
     Boolean(bool),
     Integer(i64),
     Rational(i64, i64),
-    Float(f64),
+    Float(f32),
     Character(char),
     String(String),
     Symbol(Cow<'static, str>),
@@ -1713,8 +1713,8 @@ fn parse_number(fs: String, st: TokenTag) -> Result<Datum, Error> {
                 Err(e) => match e.kind() {
                     std::num::IntErrorKind::Zero => Ok(Datum::Integer(0)),
                     std::num::IntErrorKind::PosOverflow | std::num::IntErrorKind::NegOverflow => {
-                        match s.parse::<f64>() {
-                            Ok(f) => Ok(Datum::Float(sign as f64 * f)),
+                        match s.parse::<f32>() {
+                            Ok(f) => Ok(Datum::Float(sign as f32 * f)),
                             Err(_) => Err(Error::InvalidNumber("illegal number")),
                         }
                     },
@@ -1739,12 +1739,12 @@ fn parse_number(fs: String, st: TokenTag) -> Result<Datum, Error> {
                 Err(Error::InvalidNumber("illegal number"))
             }
         }
-        TokenTag::Decimal => match s.parse::<f64>() {
-            Ok(f) => Ok(Datum::Float(sign as f64 * f)),
+        TokenTag::Decimal => match s.parse::<f32>() {
+            Ok(f) => Ok(Datum::Float(sign as f32 * f)),
             Err(_) => Err(Error::InvalidNumber("illegal number")),
         },
-        TokenTag::Infinity => Ok(Datum::Float(sign as f64 * f64::INFINITY)),
-        TokenTag::NaN => Ok(Datum::Float(sign as f64 * f64::NAN)),
+        TokenTag::Infinity => Ok(Datum::Float(sign as f32 * f32::INFINITY)),
+        TokenTag::NaN => Ok(Datum::Float(sign as f32 * f32::NAN)),
     }
 }
 fn parse_character(s: String) -> Result<char, ()> {
