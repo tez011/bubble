@@ -325,9 +325,11 @@ static CORE_PRIMITIVES: std::sync::LazyLock<std::collections::HashSet<&'static s
     "list", "cons", "append",
     "apply", "call/cc", "call-with-current-continuation", "values", "call-with-values",
     "dynamic-wind", "with-exception-handler", "raise", "raise-continuable",
+    "make-parameter", "let-parameter",
 
-    "__library_export", "__in_library", "__pop_exception_handler", "__push_exception_handler", "__peek_exception_handler",
-    "__push_dynamic_frame",
+    "__store_dynamic_extent", "__rewind_dynamic_extent",
+    "__push_dynamic_frame", "__push_exception_frame", "__push_parameter_frame",
+    "__find_exception_handler", "__find_parameter_frame",
 ].into());
 
 thread_local! {

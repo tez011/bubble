@@ -1,14 +1,13 @@
 mod cps;
 mod io;
 mod syntax;
-use std::cell::Cell;
 
 #[derive(Debug)]
 pub struct Environment {
     macros: std::collections::VecDeque<syntax::Rules>,
     bindings: std::collections::HashMap<std::borrow::Cow<'static, str>, std::collections::BTreeMap<syntax::ScopeSet, syntax::Binding>>,
-    scope_counter: Cell<usize>,
-    bound_id_counter: Cell<usize>,
+    scope_counter: std::cell::Cell<usize>,
+    bound_id_counter: std::cell::Cell<usize>,
 }
 
 fn main() {
@@ -33,24 +32,23 @@ fn main() {
             },
         };
 
-        let se = cps::transform(se, cps::ContinuationID(0), &env);
+        let se = cps::transform(se, cps::Continuation::Halt, &env);
         if let cps::Expression::Apply { operator, .. } = se {
-            match operator {
-                cps::Atom::CorePrimitive("__library_export") => {
-                    for (name, bindings) in env.bindings.iter() {
-                        match bindings.get(&Default::default()) {
-                            Some(syntax::Binding::SyntaxTransformer(i)) => {
-                                println!("(define-syntax {} {})", name, env.macros[*i]);
-                            },
-                            _ => (),
-                        }
+            if operator == cps::Atom::CorePrimitive("__library_export") {
+                for (name, bindings) in env.bindings.iter() {
+                    match bindings.get(&Default::default()) {
+                        Some(syntax::Binding::SyntaxTransformer(i)) => {
+                            println!("(define-syntax {} {})", name, env.macros[*i]);
+                        },
+                        _ => (),
                     }
-
-                },
-                _ => println!("final form: {:#?}", se),
-            };
-        } else {
-            println!("final form: {:#?}", se);
+                }
+                continue;
+            }
         }
+        println!("cps: {:?}", se);
+
+        let code = se.hoist_lambdas(cps::Continuation::Halt);
+        println!("final form: {:#?}", code);
     }
 }
