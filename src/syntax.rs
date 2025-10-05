@@ -1,4 +1,3 @@
-use crate::Environment;
 use crate::io::InputPort;
 use std::borrow::Cow;
 use std::cell::{Cell, LazyCell};
@@ -196,6 +195,14 @@ pub enum Template {
 }
 
 #[derive(Debug)]
+pub struct Environment {
+    macros: std::collections::VecDeque<Rules>,
+    bindings: std::collections::HashMap<std::borrow::Cow<'static, str>, std::collections::BTreeMap<ScopeSet, Binding>>,
+    scope_counter: std::cell::Cell<usize>,
+    bound_id_counter: std::cell::Cell<usize>,
+}
+
+#[derive(Debug)]
 pub enum Error {
     NoToken,
     UnexpectedToken,
@@ -330,6 +337,7 @@ static CORE_PRIMITIVES: std::sync::LazyLock<std::collections::HashSet<&'static s
     "__store_dynamic_extent", "__rewind_dynamic_extent",
     "__push_dynamic_frame", "__push_exception_frame", "__push_parameter_frame",
     "__find_exception_handler", "__find_parameter_frame",
+    "__debug_dump_macros",
 ].into());
 
 thread_local! {
@@ -851,9 +859,7 @@ impl std::fmt::Display for Rules {
     }
 }
 
-const MAX_RESERVED_VARIABLES: usize = 1024;
-const MAX_VARIABLE_ID: usize = usize::MAX - MAX_RESERVED_VARIABLES;
-impl crate::Environment {
+impl Environment {
     pub fn new() -> Self {
         let (core_macro_names, core_macros) = build_core_macros();
         Self {
@@ -868,16 +874,20 @@ impl crate::Environment {
         }
     }
 
+    pub fn bindings(&self) -> impl Iterator<Item = &str> {
+        self.bindings.iter().map(|(a, _)| a.as_ref())
+    }
+    pub fn macro_rules(&self, name: &str) -> Option<&Rules> {
+        match self.bindings.get(name).and_then(|bindings| bindings.get(&Default::default())) {
+            Some(Binding::SyntaxTransformer(i)) => self.macros.get(*i),
+            _ => None,
+        }
+    }
+
     pub fn new_variable(&self) -> usize {
         let binding = self.bound_id_counter.get();
-        self.bound_id_counter.set(match binding {
-            MAX_VARIABLE_ID => 0,
-            _ => binding + 1,
-        });
+        self.bound_id_counter.set(binding.wrapping_add(1));
         binding
-    }
-    pub fn reserved_variable(i: usize) -> usize {
-        MAX_VARIABLE_ID + i
     }
     fn new_scope(&self) -> usize {
         let scope = self.scope_counter.get();
@@ -1596,6 +1606,15 @@ impl crate::Environment {
                 },
             },
         }
+    }
+
+    /******** top-level expander ********/
+    pub fn expand(&mut self, stx: SyntaxObject) -> Result<Expression, Error> {
+        let stx = self.expand_and_scope(Rc::new(stx))?;
+        let stx = self.define_inner(stx)?;
+        let stx = self.expand_and_scope(stx)?;
+        eprintln!("expanded: {}", stx);
+        self.resolve_syntax(&stx)
     }
 }
 
@@ -2386,15 +2405,6 @@ fn radix(port: &mut InputPort, offset: usize, base: i32) -> Result<Option<usize>
     } else {
         Ok(None)
     }
-}
-
-/******** expander ********/
-pub fn expand(stx: SyntaxObject, env: &mut Environment) -> Result<Expression, Error> {
-    let stx = env.expand_and_scope(Rc::new(stx))?;
-    let stx = env.define_inner(stx)?;
-    let stx = env.expand_and_scope(stx)?;
-    eprintln!("expanded: {}", stx);
-    env.resolve_syntax(&stx)
 }
 
 /******** built-in macros ********/

@@ -1,24 +1,17 @@
+mod anf;
 mod cps;
 mod io;
 mod syntax;
 
-#[derive(Debug)]
-pub struct Environment {
-    macros: std::collections::VecDeque<syntax::Rules>,
-    bindings: std::collections::HashMap<std::borrow::Cow<'static, str>, std::collections::BTreeMap<syntax::ScopeSet, syntax::Binding>>,
-    scope_counter: std::cell::Cell<usize>,
-    bound_id_counter: std::cell::Cell<usize>,
-}
-
 fn main() {
     let mut stdin = std::io::stdin().lock();
     let mut handle = io::InputPort::try_from(&mut stdin as &mut dyn std::io::Read).unwrap();
-    let mut env = Environment::new();
+    let mut env = syntax::Environment::new();
     loop {
         let se = match syntax::read(&mut handle) {
-            Ok(stx) => match syntax::expand(stx, &mut env) {
+            Ok(stx) => match env.expand(stx) {
                 Ok(se) => {
-                    eprintln!("resolved: {:?}", se);
+                    eprintln!("resolved: {:#?}", se);
                     se
                 },
                 Err(e) => {
@@ -31,24 +24,17 @@ fn main() {
                 continue;
             },
         };
-
-        let se = cps::transform(se, cps::Continuation::Halt, &env);
-        if let cps::Expression::Apply { operator, .. } = se {
-            if operator == cps::Atom::CorePrimitive("__library_export") {
-                for (name, bindings) in env.bindings.iter() {
-                    match bindings.get(&Default::default()) {
-                        Some(syntax::Binding::SyntaxTransformer(i)) => {
-                            println!("(define-syntax {} {})", name, env.macros[*i]);
-                        },
-                        _ => (),
-                    }
+        if let syntax::Expression::ProcedureCall { operator, .. } = &se {
+            if let syntax::Expression::CorePrimitive(operator) = operator.as_ref() {
+                if *operator == "__debug_dump_macros" {
+                    env.bindings().filter_map(|name| env.macro_rules(name).map(|r| (name, r)))
+                        .for_each(|(name, rules)| println!("(define-syntax {} {})", name, rules));
+                    continue;
                 }
-                continue;
             }
         }
-        println!("cps: {:?}", se);
 
-        let code = se.hoist_lambdas(cps::Continuation::Halt);
-        println!("final form: {:#?}", code);
+        let se = anf::transform(se, &env);
+        eprintln!("final form: {:#?}", se);
     }
 }
