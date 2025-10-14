@@ -115,7 +115,7 @@ pub enum Error {
 type Result<T> = core::result::Result<T, Error>;
 
 #[derive(Debug)]
-pub struct Environment<'stx> {
+struct Environment<'stx> {
     stx_env: &'stx syntax::Environment,
     visible_bindings: HashSet<ValueID>,
 }
@@ -129,7 +129,7 @@ impl<'stx> From<&'stx syntax::Environment> for Environment<'stx> {
 }
 
 impl Expression {
-    fn visit<T>(&self, accumulator: T, mut f: impl FnMut(T, &Expression) -> ControlFlow<T, T>) -> ControlFlow<T, T> {
+    fn visit<T>(&self, init: T, mut f: impl FnMut(T, &Expression) -> ControlFlow<T, T>) -> ControlFlow<T, T> {
         fn visit_children<T>(expr: &Expression, init: T, f: &mut impl FnMut(T, &Expression) -> ControlFlow<T, T>) -> ControlFlow<T, T> {
             use Expression::*;
             match expr {
@@ -163,10 +163,10 @@ impl Expression {
             }
         }
 
-        let r = visit_children(self, accumulator, &mut f)?;
+        let r = visit_children(self, init, &mut f)?;
         f(r, self)
     }
-    fn visit_mut<T>(&mut self, accumulator: T, mut f: impl FnMut(T, &mut Expression) -> ControlFlow<T, T>) -> ControlFlow<T, T> {
+    fn visit_mut<T>(&mut self, init: T, mut f: impl FnMut(T, &mut Expression) -> ControlFlow<T, T>) -> ControlFlow<T, T> {
         fn visit_children<T>(expr: &mut Expression, init: T, f: &mut impl FnMut(T, &mut Expression) -> ControlFlow<T, T>) -> ControlFlow<T, T> {
             use Expression::*;
             match expr {
@@ -200,7 +200,7 @@ impl Expression {
             }
         }
 
-        let r = visit_children(self, accumulator, &mut f)?;
+        let r = visit_children(self, init, &mut f)?;
         f(r, self)
     }
 
@@ -208,7 +208,7 @@ impl Expression {
         self.visit(0, |count, _| ControlFlow::Continue(count + 1))
             .continue_value().unwrap()
     }
-    fn uses_variable(&mut self, id: ValueID) -> usize {
+    fn uses_variable(&self, id: ValueID) -> usize {
         self.visit(0, |count, e| {
             use Expression::*;
             ControlFlow::Continue(count + match e {
@@ -219,154 +219,13 @@ impl Expression {
             })
         }).continue_value().unwrap()
     }
-}
 
-impl<'stx> Environment<'stx> {
-    fn new_variable(&self) -> usize {
-        self.stx_env.new_variable()
-    }
-
-    fn atomize(&mut self, e: syntax::Expression, then: impl FnOnce(Atom, &mut Self) -> Expression) -> Expression {
-        use syntax::Expression as stx;
-        match e {
-            stx::CorePrimitive(s) => then(Atom::CorePrimitive(s), self),
-            stx::Variable(i) => then(Atom::Variable(ValueID(i)), self),
-            stx::Literal(syntax::Literal::Copy(x)) => then(Atom::Literal(x), self),
-            _ => {
-                let x = ValueID(self.new_variable());
-                let k = then(Atom::Variable(x), self);
-                self.new_expression(e, Continuation::Def(ContinuationDef {
-                    formals: (vec![x], None),
-                    body: Box::new(k),
-                }))
-            },
-        }
-    }
-    fn atomize_many(&mut self, ee: Vec<syntax::Expression>, then: impl FnOnce(Vec<Atom>, &mut Self) -> Expression) -> Expression {
-        use syntax::Expression as stx;
-        let (atoms, new_ids) = ee.iter().map(|e| match e {
-            stx::CorePrimitive(s) => (Atom::CorePrimitive(s), None),
-            stx::Variable(i) => (Atom::Variable(ValueID(*i)), None),
-            stx::Literal(syntax::Literal::Copy(x)) => (Atom::Literal(*x), None),
-            _ => {
-                let x = ValueID(self.new_variable());
-                (Atom::Variable(x), Some(x))
-            },
-        }).collect::<(Vec<_>, Vec<_>)>();
-        std::iter::zip(new_ids.into_iter(), ee.into_iter()).rev()
-            .fold(then(atoms, self), |k, (id, e)| match id {
-                None => k,
-                Some(x) => self.new_expression(e, Continuation::Def(ContinuationDef {
-                    formals: (vec![x], None),
-                    body: Box::new(k),
-                })),
-            })
-    }
-    fn atomize_continuation(&mut self, k: Continuation, then: impl FnOnce(ContinuationRef, &mut Self) -> Expression) -> Expression {
-        match k {
-            Continuation::Ref(k) => then(k, self),
-            Continuation::Def(k) => {
-                let id = ContinuationID(self.new_variable());
-                Expression::LetContinuation { id, k, body: Box::new(then(ContinuationRef::To(id), self)) }
-            }
-        }
-    }
-    fn new_expression(&mut self, e: syntax::Expression, k: Continuation) -> Expression {
-        use syntax::Expression as stx;
-        use Expression::*;
-
-        match e {
-            stx::CorePrimitive(s) => Continue {
-                k,
-                values: (vec![Atom::CorePrimitive(s)], None),
-            },
-            stx::Variable(i) => Continue {
-                k,
-                values: (vec![Atom::Variable(ValueID(i))], None),
-            },
-            stx::Literal(syntax::Literal::Copy(x)) => Continue {
-                k,
-                values: (vec![Atom::Literal(x)], None),
-            },
-            stx::Literal(syntax::Literal::NoCopy(val)) => {
-                let id = ValueID(self.new_variable());
-                LetLiteral {
-                    id,
-                    val,
-                    body: Box::new(Continue {
-                        k,
-                        values: (vec![Atom::Variable(id)], None),
-                    }),
-                }
-            },
-            stx::ProcedureCall { operator, operands } => {
-                self.atomize(*operator, move |operator, env|
-                    env.atomize_many(operands, move |operands, _|
-                        Apply { operator, operands: (operands, None), kontract: Arity::Unknown, k }))
-            },
-            stx::Lambda { formals, body } => {
-                let id = ValueID(self.new_variable());
-                let formals = (formals.0.iter().map(ValueID::from).collect(), formals.1.map(|e| ValueID::from(e.as_ref())));
-                let escape = ContinuationID(self.new_variable());
-                let body = self.new_block(body, Continuation::from(escape));
-                LetLambda {
-                    id,
-                    val: Lambda {
-                        formals,
-                        escape: ContinuationRef::To(escape),
-                        body: Box::new(body),
-                    },
-                    body: Box::new(Continue {
-                        k,
-                        values: (vec![Atom::Variable(id)], None),
-                    }),
-                }
-            },
-            stx::Conditional { test, consequent, alternate } => {
-                self.atomize_continuation(k, move |k, env|
-                    env.atomize(*test, move |test, env| Branch {
-                        test,
-                        consequent: Box::new(env.new_expression(*consequent, Continuation::Ref(k))),
-                        alternate: match alternate {
-                            Some(e) => Box::new(env.new_expression(*e, Continuation::Ref(k))),
-                            None => Box::new(Continue { k: Continuation::Ref(k), values: (vec![Atom::Literal(LiteralC::Boolean(false))], None) }),
-                        },
-                    }))
-            },
-            stx::Assignment { ids, value } | stx::Definition { ids, value } => {
-                let x = ValueID(self.new_variable());
-                self.new_expression(*value, Continuation::Def(ContinuationDef {
-                    formals: (vec![], Some(x)),
-                    body: Box::new(Assign {
-                        vars: (ids.0.iter().map(ValueID::from).collect(), ids.1.map(|e| ValueID::from(e.as_ref()))),
-                        values: (vec![], Some(x)),
-                        k,
-                    }),
-                }))
-            },
-            stx::Block { body } => self.new_block(body, k),
-        }
-    }
-    fn new_block(&mut self, e: Vec<syntax::Expression>, k: Continuation) -> Expression {
-        use Expression::*;
-        let mut ee = e.into_iter().rev();
-        if let Some(tail) = ee.next() {
-            ee.fold(self.new_expression(tail, k), |acc, e|
-                self.new_expression(e, Continuation::Def(ContinuationDef { formals: (vec![], Some(ValueID::invalid())), body: Box::new(acc) })))
-        } else {
-            Continue { k, values: (vec![], None) }
-        }
-    }
-}
-
-impl Expression {
     fn check_arity(&mut self) -> Result<()> {
         use Expression::*;
         let mut in_lambdas = HashMap::new(); // The arity of inputs to each lambda
         let mut mid_lambdas = HashMap::new();
         let mut continues = HashMap::new(); // The arity of inputs to each non-inline continuation
 
-        eprintln!("check_arity: {:#?}", self);
         self.visit((), |_, e| {
             if let LetLambda { id, val: Lambda { formals, escape, body }, .. } = e {
                 in_lambdas.insert(*id, Arity::from(formals));
@@ -561,15 +420,153 @@ impl Expression {
             false
         }
     }
+}
 
-    fn optimize(&mut self, env: &mut Environment) -> Result<bool> {
+impl<'stx> Environment<'stx> {
+    fn new_variable(&self) -> usize {
+        self.stx_env.new_variable()
+    }
+
+    fn atomize(&mut self, e: syntax::Expression, then: impl FnOnce(Atom, &mut Self) -> Expression) -> Expression {
+        use syntax::Expression as stx;
+        match e {
+            stx::CorePrimitive(s) => then(Atom::CorePrimitive(s), self),
+            stx::Variable(i) => then(Atom::Variable(ValueID(i)), self),
+            stx::Literal(syntax::Literal::Copy(x)) => then(Atom::Literal(x), self),
+            _ => {
+                let x = ValueID(self.new_variable());
+                let k = then(Atom::Variable(x), self);
+                self.new_expression(e, Continuation::Def(ContinuationDef {
+                    formals: (vec![x], None),
+                    body: Box::new(k),
+                }))
+            },
+        }
+    }
+    fn atomize_many(&mut self, ee: Vec<syntax::Expression>, then: impl FnOnce(Vec<Atom>, &mut Self) -> Expression) -> Expression {
+        use syntax::Expression as stx;
+        let (atoms, new_ids) = ee.iter().map(|e| match e {
+            stx::CorePrimitive(s) => (Atom::CorePrimitive(s), None),
+            stx::Variable(i) => (Atom::Variable(ValueID(*i)), None),
+            stx::Literal(syntax::Literal::Copy(x)) => (Atom::Literal(*x), None),
+            _ => {
+                let x = ValueID(self.new_variable());
+                (Atom::Variable(x), Some(x))
+            },
+        }).collect::<(Vec<_>, Vec<_>)>();
+        std::iter::zip(new_ids.into_iter(), ee.into_iter()).rev()
+            .fold(then(atoms, self), |k, (id, e)| match id {
+                None => k,
+                Some(x) => self.new_expression(e, Continuation::Def(ContinuationDef {
+                    formals: (vec![x], None),
+                    body: Box::new(k),
+                })),
+            })
+    }
+    fn atomize_continuation(&mut self, k: Continuation, then: impl FnOnce(ContinuationRef, &mut Self) -> Expression) -> Expression {
+        match k {
+            Continuation::Ref(k) => then(k, self),
+            Continuation::Def(k) => {
+                let id = ContinuationID(self.new_variable());
+                Expression::LetContinuation { id, k, body: Box::new(then(ContinuationRef::To(id), self)) }
+            }
+        }
+    }
+    fn new_expression(&mut self, e: syntax::Expression, k: Continuation) -> Expression {
+        use syntax::Expression as stx;
         use Expression::*;
-        match self {
+
+        match e {
+            stx::CorePrimitive(s) => Continue {
+                k,
+                values: (vec![Atom::CorePrimitive(s)], None),
+            },
+            stx::Variable(i) => Continue {
+                k,
+                values: (vec![Atom::Variable(ValueID(i))], None),
+            },
+            stx::Literal(syntax::Literal::Copy(x)) => Continue {
+                k,
+                values: (vec![Atom::Literal(x)], None),
+            },
+            stx::Literal(syntax::Literal::NoCopy(val)) => {
+                let id = ValueID(self.new_variable());
+                LetLiteral {
+                    id,
+                    val,
+                    body: Box::new(Continue {
+                        k,
+                        values: (vec![Atom::Variable(id)], None),
+                    }),
+                }
+            },
+            stx::ProcedureCall { operator, operands } => {
+                self.atomize(*operator, move |operator, env|
+                    env.atomize_many(operands, move |operands, _|
+                        Apply { operator, operands: (operands, None), kontract: Arity::Unknown, k }))
+            },
+            stx::Lambda { formals, body } => {
+                let id = ValueID(self.new_variable());
+                let formals = (formals.0.iter().map(ValueID::from).collect(), formals.1.map(|e| ValueID::from(e.as_ref())));
+                let escape = ContinuationID(self.new_variable());
+                let body = self.new_block(body, Continuation::from(escape));
+                LetLambda {
+                    id,
+                    val: Lambda {
+                        formals,
+                        escape: ContinuationRef::To(escape),
+                        body: Box::new(body),
+                    },
+                    body: Box::new(Continue {
+                        k,
+                        values: (vec![Atom::Variable(id)], None),
+                    }),
+                }
+            },
+            stx::Conditional { test, consequent, alternate } => {
+                self.atomize_continuation(k, move |k, env|
+                    env.atomize(*test, move |test, env| Branch {
+                        test,
+                        consequent: Box::new(env.new_expression(*consequent, Continuation::Ref(k))),
+                        alternate: match alternate {
+                            Some(e) => Box::new(env.new_expression(*e, Continuation::Ref(k))),
+                            None => Box::new(Continue { k: Continuation::Ref(k), values: (vec![Atom::Literal(LiteralC::Boolean(false))], None) }),
+                        },
+                    }))
+            },
+            stx::Assignment { ids, value } | stx::Definition { ids, value } => {
+                let x = ValueID(self.new_variable());
+                self.new_expression(*value, Continuation::Def(ContinuationDef {
+                    formals: (vec![], Some(x)),
+                    body: Box::new(Assign {
+                        vars: (ids.0.iter().map(ValueID::from).collect(), ids.1.map(|e| ValueID::from(e.as_ref()))),
+                        values: (vec![], Some(x)),
+                        k,
+                    }),
+                }))
+            },
+            stx::Block { body } => self.new_block(body, k),
+        }
+    }
+    fn new_block(&mut self, e: Vec<syntax::Expression>, k: Continuation) -> Expression {
+        use Expression::*;
+        let mut ee = e.into_iter().rev();
+        if let Some(tail) = ee.next() {
+            ee.fold(self.new_expression(tail, k), |acc, e|
+                self.new_expression(e, Continuation::Def(ContinuationDef { formals: (vec![], Some(ValueID::invalid())), body: Box::new(acc) })))
+        } else {
+            Continue { k, values: (vec![], None) }
+        }
+    }
+
+    fn optimize(&mut self, e: &mut Expression) -> Result<bool> {
+        use Expression::*;
+        match e {
             TakenOut => unreachable!(),
-            LetLiteral { id, body, .. } if !env.visible_bindings.contains(id) => {
+            LetLiteral { id, body, .. } if !self.visible_bindings.contains(id) => {
                 let uses = body.uses_variable(*id);
                 if uses == 0 {
-                    *self = std::mem::take(body);
+                    *e = std::mem::take(body);
                     Ok(true)
                 } else if uses == 1 {
                     Ok(body.visit_mut(false, |modified, e| ControlFlow::Continue(match e {
@@ -580,7 +577,7 @@ impl Expression {
                     Ok(false)
                 }
             },
-            LetLambda { id, val, body } if !env.visible_bindings.contains(id) => {
+            LetLambda { id, val, body } if !self.visible_bindings.contains(id) => {
                 let uses = body.uses_variable(*id);
                 let applies = body.visit(0, |count, e| match e {
                     Apply { operator: Atom::Variable(operator), .. } if operator == id => ControlFlow::Continue(count + 1),
@@ -591,7 +588,7 @@ impl Expression {
                     _ => ControlFlow::Continue(()),
                 }).is_break();
                 if uses == 0 {
-                    *self = std::mem::take(body);
+                    *e = std::mem::take(body);
                     Ok(true)
                 } else if uses == 1 && applies == 0 {
                     Ok(body.visit_mut(false, |modified, e| ControlFlow::Continue(match e {
@@ -609,7 +606,7 @@ impl Expression {
                         },
                         _ => ControlFlow::Continue(()),
                     });
-                    *self = std::mem::take(body);
+                    *e = std::mem::take(body);
                     Ok(true)
                 } else {
                     Ok(false)
@@ -624,7 +621,7 @@ impl Expression {
                 }).continue_value().unwrap();
 
                 if uses == 0 {
-                    *self = std::mem::take(body);
+                    *e = std::mem::take(body);
                     Ok(true)
                 } else if uses == applies && k.body.complexity() < BETA_EXPANSION_COMPLEXITY_THRESHOLD {
                     body.visit_mut((), |_, e| match e {
@@ -644,7 +641,7 @@ impl Expression {
             Apply { operator, operands: (operands, operands_tail), kontract, k } => {
                 match operator {
                     Atom::CorePrimitive("apply") => {
-                        *self = Apply {
+                        *e = Apply {
                             operator: *operands.first().unwrap(),
                             operands: (operands.split_off(1), *operands_tail),
                             kontract: *kontract,
@@ -653,10 +650,10 @@ impl Expression {
                         Ok(true)
                     },
                     Atom::CorePrimitive("call/cc") => {
-                        let stored_dynamic_extent = ValueID(env.new_variable());
-                        let reified_cont = ValueID(env.new_variable());
-                        let values = ValueID(env.new_variable());
-                        *self = env.atomize_continuation(std::mem::take(k), |k, _| Apply {
+                        let stored_dynamic_extent = ValueID(self.new_variable());
+                        let reified_cont = ValueID(self.new_variable());
+                        let values = ValueID(self.new_variable());
+                        *e = self.atomize_continuation(std::mem::take(k), |k, _| Apply {
                             operator: Atom::CorePrimitive("__store_dynamic_extent"),
                             operands: (vec![], None),
                             kontract: Arity::Exact(1),
@@ -689,8 +686,8 @@ impl Expression {
                         Ok(true)
                     },
                     Atom::CorePrimitive("call-with-values") => {
-                        let values = ValueID(env.new_variable());
-                        *self = Apply {
+                        let values = ValueID(self.new_variable());
+                        *e = Apply {
                             operator: *operands.get(0).unwrap(),
                             operands: (vec![], None),
                             kontract: Arity::Unknown,
@@ -707,9 +704,9 @@ impl Expression {
                         Ok(true)
                     },
                     Atom::CorePrimitive("dynamic-wind") => {
-                        let stored_dynamic_extent = ValueID(env.new_variable());
-                        let thunk_values = ValueID(env.new_variable());
-                        *self = Apply {
+                        let stored_dynamic_extent = ValueID(self.new_variable());
+                        let thunk_values = ValueID(self.new_variable());
+                        *e = Apply {
                             operator: *operands.get(0).unwrap(),
                             operands: (vec![], None),
                             kontract: Arity::Exact(0),
@@ -748,16 +745,16 @@ impl Expression {
                         Ok(true)
                     },
                     Atom::CorePrimitive("values") => {
-                        *self = Continue {
+                        *e = Continue {
                             k: std::mem::take(k),
                             values: (std::mem::take(operands), *operands_tail),
                         };
                         Ok(true)
                     },
                     Atom::CorePrimitive("raise") => {
-                        let eh = ValueID(env.new_variable());
-                        let old_extent = ValueID(env.new_variable());
-                        *self = Apply {
+                        let eh = ValueID(self.new_variable());
+                        let old_extent = ValueID(self.new_variable());
+                        *e = Apply {
                             operator: Atom::CorePrimitive("__find_exception_handler"),
                             operands: (vec![], None),
                             kontract: Arity::Exact(2),
@@ -782,8 +779,8 @@ impl Expression {
                         Ok(true)
                     },
                     Atom::CorePrimitive("raise-continuable") => {
-                        let eh = ValueID(env.new_variable());
-                        *self = Apply {
+                        let eh = ValueID(self.new_variable());
+                        *e = Apply {
                             operator: Atom::CorePrimitive("__find_exception_handler"),
                             operands: (vec![], None),
                             kontract: Arity::Exact(2),
@@ -800,9 +797,9 @@ impl Expression {
                         Ok(true)
                     },
                     Atom::CorePrimitive("with-exception-handler") => {
-                        let dynamic_extent = ValueID(env.new_variable());
-                        let thunk_values = ValueID(env.new_variable());
-                        *self = Apply {
+                        let dynamic_extent = ValueID(self.new_variable());
+                        let thunk_values = ValueID(self.new_variable());
+                        *e = Apply {
                             operator: Atom::CorePrimitive("__push_exception_handler"),
                             operands: (vec![*operands.get(0).unwrap()], None),
                             kontract: Arity::Exact(1),
@@ -837,22 +834,22 @@ impl Expression {
             }
             Branch { test, consequent, alternate } => match test {
                 Atom::Literal(LiteralC::Boolean(false)) => {
-                    *self = std::mem::take(alternate);
+                    *e = std::mem::take(alternate);
                     Ok(true)
                 },
                 Atom::Literal(_) | Atom::CorePrimitive(_) => {
-                    *self = std::mem::take(consequent);
+                    *e = std::mem::take(consequent);
                     Ok(true)
                 },
                 _ => Ok(false),
             },
             Continue { k: Continuation::Def(ContinuationDef { formals, body }), values } => {
                 body.rename(formals, &*values);
-                *self = std::mem::take(body);
+                *e = std::mem::take(body);
                 Ok(true)
             },
             Assign { vars, k, .. } if vars.0.is_empty() && vars.1.is_none() => {
-                *self = Continue { k: std::mem::take(k), values: (vec![], None) };
+                *e = Continue { k: std::mem::take(k), values: (vec![], None) };
                 Ok(true)
             },
             _ => Ok(false),
@@ -868,7 +865,7 @@ pub fn transform(e: syntax::Expression, k: ContinuationRef, env: &syntax::Enviro
     loop {
         let next = e.visit_mut(Ok(&mut env), |acc, e| {
             let env = acc.unwrap();
-            match e.optimize(env) {
+            match env.optimize(e) {
                 Ok(true) => ControlFlow::Break(Ok(env)),
                 Ok(false) => ControlFlow::Continue(Ok(env)),
                 Err(e) => ControlFlow::Break(Err(e)),
