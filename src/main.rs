@@ -5,12 +5,12 @@ mod io;
 mod syntax;
 
 fn main() {
-    let mut env = syntax::Environment::new();
+    let mut env = common::Environment::new();
     let mut stdin = std::io::stdin().lock();
     let mut handle = io::InputPort::try_from(&mut stdin as &mut dyn std::io::Read).unwrap();
     loop {
         let se = match syntax::read(&mut handle) {
-            Ok(stx) => match env.expand(stx) {
+            Ok(stx) => match syntax::expand(stx, &mut env) {
                 Ok(se) => {
                     eprintln!("resolved: {:#?}", se);
                     se
@@ -35,7 +35,7 @@ fn main() {
             }
         }
 
-        let se = cps::transform(se, cps::ContinuationRef::Escape, &env).unwrap();
+        let se = cps::transform(se, cps::ContinuationRef::Escape, &mut env).unwrap();
         println!("cps: {:#?}", se);
 
         let se = anf::transform(se, &env);

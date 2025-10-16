@@ -1,22 +1,19 @@
-use crate::common::Arity;
+use crate::common::{Arity, Environment as CommonEnvironment};
 use crate::cps;
 use crate::cps::{Atom, Continuation, ContinuationDef, ContinuationRef, ValueID};
 use crate::syntax;
-use std::collections::HashSet;
 use std::ops::ControlFlow;
 const BETA_EXPANSION_COMPLEXITY_THRESHOLD: usize = 11;
 
 #[derive(Debug)]
-struct Environment<'stx> {
-    stx_env: &'stx syntax::Environment,
-    visible_bindings: HashSet<ValueID>,
+struct Environment<'c> {
+    parent_env: &'c CommonEnvironment,
     current_return: cps::ContinuationRef,
 }
-impl<'stx> From<&'stx syntax::Environment> for Environment<'stx> {
-    fn from(stx_env: &'stx syntax::Environment) -> Self {
+impl<'c> From<&'c CommonEnvironment> for Environment<'c> {
+    fn from(parent_env: &'c CommonEnvironment) -> Self {
         Self {
-            stx_env,
-            visible_bindings: stx_env.bound_variables().map(ValueID).collect(),
+            parent_env,
             current_return: ContinuationRef::Escape,
         }
     }
@@ -210,17 +207,13 @@ impl<'stx> Environment<'stx> {
     fn new_variables(&self, arity: Arity) -> (Vec<ValueID>, Option<ValueID>) {
         let arity = match arity {
             Arity::Exact(n) => (n, None),
-            Arity::AtLeast(n) => (n, Some(ValueID(self.stx_env.new_variable()))),
-            Arity::Unknown => (0, Some(ValueID(self.stx_env.new_variable()))),
-            // TODO this is a temporary fix. We should store/load arity of visible bindings.
+            Arity::AtLeast(n) => (n, Some(ValueID(self.parent_env.new_variable()))),
+            Arity::Unknown => panic!(),
         };
-        ((0..arity.0).map(|_| ValueID(self.stx_env.new_variable())).collect(), arity.1)
+        ((0..arity.0).map(|_| ValueID(self.parent_env.new_variable())).collect(), arity.1)
     }
-    fn with_return<R>(&mut self, k: cps::ContinuationRef, f: impl FnOnce(&mut Self) -> R) -> R {
-        let old = std::mem::replace(&mut self.current_return, k);
-        let r = f(self);
-        self.current_return = old;
-        r
+    fn binding_visible(&self, id: &ValueID) -> bool {
+        self.parent_env.bound_variables.contains(&id.0)
     }
     fn is_escape(&self, k: &cps::Continuation) -> bool {
         match k {
@@ -228,6 +221,12 @@ impl<'stx> Environment<'stx> {
             cps::Continuation::Ref(k) if *k == self.current_return => true,
             _ => false,
         }
+    }
+    fn with_return<R>(&mut self, k: cps::ContinuationRef, f: impl FnOnce(&mut Self) -> R) -> R {
+        let old = std::mem::replace(&mut self.current_return, k);
+        let r = f(self);
+        self.current_return = old;
+        r
     }
 
     fn transform_cps(&mut self, e: cps::Expression) -> Expression {
@@ -355,7 +354,9 @@ impl<'stx> Environment<'stx> {
             Let { id, val: Rhs::Literal(_), body } => {
                 if id.0.len() != 1 || id.1.is_some() { unreachable!(); }
                 let id = id.0.first_mut().unwrap();
-                if !self.visible_bindings.contains(id) && body.count_uses(*id) == 0 {
+                if self.binding_visible(id) {
+                    false
+                } else if body.count_uses(*id) == 0 {
                     *e = std::mem::take(body);
                     true
                 } else {
@@ -381,7 +382,9 @@ impl<'stx> Environment<'stx> {
                     ControlFlow::Continue(x) => x,
                     ControlFlow::Break(x) => x,
                 };
-                if !self.visible_bindings.contains(lambda_id) && uses == 0 {
+                if self.binding_visible(lambda_id) {
+                    false
+                } else if uses == 0 {
                     *e = std::mem::take(body);
                     true
                 } else if uses == applies && !is_recursive && (applies == 1 || lambda.body.complexity() < BETA_EXPANSION_COMPLEXITY_THRESHOLD) {
@@ -413,7 +416,7 @@ impl<'stx> Environment<'stx> {
                 }
             },
             Let { id, val: Rhs::Values { values }, body } => {
-                if id.0.iter().chain(id.1.iter()).all(|i| !self.visible_bindings.contains(i)) {
+                if id.0.iter().chain(id.1.iter()).all(|i| !self.binding_visible(i)) {
                     body.rename(&id, &values);
                     *e = std::mem::take(body);
                     true
@@ -438,7 +441,7 @@ impl<'stx> Environment<'stx> {
     }
 }
 
-pub fn transform(e: cps::Expression, env: &syntax::Environment) -> Expression {
+pub fn transform(e: cps::Expression, env: &CommonEnvironment) -> Expression {
     let mut env = Environment::from(env);
     let mut e = env.transform_cps(e);
 

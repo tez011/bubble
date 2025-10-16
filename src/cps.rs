@@ -1,4 +1,4 @@
-use crate::common::Arity;
+use crate::common::{Arity, Binding, Environment as CommonEnvironment};
 use crate::syntax;
 use crate::syntax::{LiteralC, LiteralD};
 use std::collections::{HashSet, HashMap};
@@ -120,16 +120,22 @@ pub enum Error {
 type Result<T> = core::result::Result<T, Error>;
 
 #[derive(Debug)]
-struct Environment<'stx> {
-    stx_env: &'stx syntax::Environment,
-    visible_bindings: HashSet<ValueID>,
+struct Environment<'c>(&'c mut CommonEnvironment);
+impl<'c> From<&'c mut CommonEnvironment> for Environment<'c> {
+    fn from(env: &'c mut CommonEnvironment) -> Self {
+        Self(env)
+    }
 }
-impl<'stx> From<&'stx syntax::Environment> for Environment<'stx> {
-    fn from(stx_env: &'stx syntax::Environment) -> Self {
-        Self {
-            stx_env,
-            visible_bindings: stx_env.bound_variables().map(ValueID).collect(),
-        }
+impl<'c> std::ops::Deref for Environment<'c> {
+    type Target = &'c mut CommonEnvironment;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+impl<'c> std::ops::DerefMut for Environment<'c> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.0
     }
 }
 
@@ -225,126 +231,6 @@ impl Expression {
         }).continue_value().unwrap()
     }
 
-    fn check_arity(&mut self) -> Result<()> {
-        use Expression::*;
-        let mut in_lambdas = HashMap::new(); // The arity of inputs to each lambda
-        let mut mid_lambdas = HashMap::new();
-        let mut continues = HashMap::new(); // The arity of inputs to each non-inline continuation
-
-        self.visit((), |_, e| {
-            if let LetLambda { id, val: Lambda { formals, escape, body }, .. } = e {
-                in_lambdas.insert(*id, Arity::from(formals));
-                mid_lambdas.insert(*id, body.visit((None, HashSet::new()), |(explicits, mut applies), e| {
-                    if let Continue { k: Continuation::Ref(k), values } = e {
-                        if k == escape {
-                            return match explicits {
-                                None => ControlFlow::Continue((Some(Arity::from(values)), applies)),
-                                Some(explicits) => ControlFlow::Continue((Some(explicits.join(Arity::from(values))), applies)),
-                            };
-                        }
-                    } else if let Apply { operator, k: Continuation::Ref(k), .. } = e {
-                        if k == escape {
-                            if let Atom::CorePrimitive(operator) = operator {
-                                let out_arity = crate::common::PRIMITIVES.get(operator).unwrap().1;
-                                return match explicits {
-                                    None => ControlFlow::Continue((Some(out_arity), applies)),
-                                    Some(explicits) => ControlFlow::Continue((Some(explicits.join(out_arity)), applies)),
-                                };
-                            } else if let Atom::Variable(x) = operator {
-                                applies.insert(*x);
-                            }
-                        }
-                    }
-                    ControlFlow::Continue((explicits, applies))
-                }).continue_value().unwrap());
-            } else if let LetContinuation { id, k: ContinuationDef { formals, .. }, .. } = e {
-                continues.insert(*id, Arity::from(formals));
-            }
-            ControlFlow::Continue(())
-        }).continue_value().unwrap();
-
-        let mut out_lambdas = HashMap::new(); // The arity of outputs from each lambda
-        let mut mid_lambdas = mid_lambdas.into_iter()
-            .collect::<Vec<_>>();
-        mid_lambdas.sort_by_key(|(_, (_, deps))| deps.len());
-        for (id, (base_arity, deps)) in mid_lambdas.into_iter() {
-            let dep_arity = deps.iter()
-                .map(|x| out_lambdas.get(x).copied().unwrap_or(Arity::Unknown))
-                .reduce(|acc, e| acc.join(e));
-            out_lambdas.insert(id, match (base_arity, dep_arity) {
-                (None, None) => Arity::Unknown,
-                (None, Some(x)) | (Some(x), None) => x,
-                (Some(a), Some(b)) => a.join(b),
-            });
-        }
-
-        let k_arity = |k: &Continuation| match k {
-            Continuation::Ref(ContinuationRef::To(k)) => continues.get(k).copied(),
-            Continuation::Ref(_) => Some(Arity::Unknown),
-            Continuation::Def(ContinuationDef { formals, .. }) => Some(Arity::from(formals)),
-        };
-        match self.visit_mut(None, |_, e| {
-            if let Apply { operator, operands, kontract, k } = e {
-                match operator {
-                    Atom::Literal(_) => return ControlFlow::Break(Some(Error::InvalidApplication { operator: *operator })),
-                    Atom::Variable(x) => {
-                        let (expected, actual) = (in_lambdas.get(x).copied().unwrap_or(Arity::Unknown), Arity::from(&*operands));
-                        if !expected.compatible_with(actual) {
-                            return ControlFlow::Break(Some(Error::InvalidApplicationArity { operator: *operator, expected, actual }));
-                        }
-                        if let Some(actual) = out_lambdas.get(x).copied() {
-                            if let Some(expected) = k_arity(k) {
-                                if !expected.compatible_with(actual) {
-                                    return ControlFlow::Break(Some(Error::InvalidContinuationArity { expected, actual }));
-                                }
-                            }
-                            *kontract = actual;
-                        }
-                    }
-                    Atom::CorePrimitive(s) => {
-                        let primitive_arity = crate::common::PRIMITIVES.get(s).copied().unwrap();
-                        let (expected, actual) = (primitive_arity.0, Arity::from(&*operands));
-                        if !expected.compatible_with(actual) {
-                            return ControlFlow::Break(Some(Error::InvalidApplicationArity { operator: *operator, expected, actual }));
-                        }
-                        let actual = primitive_arity.1;
-                        if actual != Arity::Unknown { // optimization of the core primitive will take care of this later
-                            if let Some(expected) = k_arity(k) {
-                                if !expected.compatible_with(actual) {
-                                    return ControlFlow::Break(Some(Error::InvalidContinuationArity { expected, actual }));
-                                }
-                            }
-                            *kontract = actual;
-                        }
-                    }
-                }
-            } else if let Continue { k, values } = e {
-                if let Some(expected) = k_arity(k) {
-                    let actual = Arity::from(&*values);
-                    if !expected.compatible_with(actual) {
-                        return ControlFlow::Break(Some(Error::InvalidContinuationArity { expected, actual }));
-                    }
-                }
-            } else if let Assign { vars, values, k } = e {
-                let expected = Arity::from(&*values);
-                let actual = Arity::from(&*vars);
-                if !expected.compatible_with(actual) {
-                    return ControlFlow::Break(Some(Error::InvalidContinuationArity { expected, actual }));
-                }
-                if let Some(expected) = k_arity(k) {
-                    let actual = Arity::Exact(0);
-                    if !expected.compatible_with(actual) {
-                        return ControlFlow::Break(Some(Error::InvalidContinuationArity { expected, actual }));
-                    }
-                }
-            }
-            ControlFlow::Continue(None)
-        }) {
-            ControlFlow::Break(Some(e)) => Err(e),
-            _ => Ok(()),
-        }
-    }
-
     fn rename(&mut self, from: &(Vec<ValueID>, Option<ValueID>), to: &(Vec<Atom>, Option<ValueID>)) -> bool {
         assert!(from.0.len() <= to.0.len());
         let mapping = std::iter::zip(from.0.iter().copied(), to.0.iter().copied()).collect::<HashMap<_, _>>();
@@ -427,9 +313,9 @@ impl Expression {
     }
 }
 
-impl<'stx> Environment<'stx> {
-    fn new_variable(&self) -> usize {
-        self.stx_env.new_variable()
+impl<'c> Environment<'c> {
+    fn binding_visible(&self, id: &ValueID) -> bool {
+        self.bound_variables.contains(&id.0)
     }
 
     fn atomize(&mut self, e: syntax::Expression, then: impl FnOnce(Atom, &mut Self) -> Expression) -> Expression {
@@ -564,11 +450,138 @@ impl<'stx> Environment<'stx> {
         }
     }
 
+    fn check_arity(&mut self, e: &mut Expression) -> Result<()> {
+        use Expression::*;
+        let mut io_lambdas = HashMap::new(); // The arity of inputs to each lambda
+        let mut mid_lambdas = HashMap::new();
+        let mut continues = HashMap::new(); // The arity of inputs to each non-inline continuation
+        e.visit((), |_, e| {
+            if let LetLambda { id, val: Lambda { formals, escape, body }, .. } = e {
+                io_lambdas.insert(*id, (Arity::from(formals), Arity::Unknown));
+                mid_lambdas.insert(*id, body.visit((None, HashSet::new()), |(explicits, mut applies), e| {
+                    if let Continue { k: Continuation::Ref(k), values } = e {
+                        if k == escape {
+                            return match explicits {
+                                None => ControlFlow::Continue((Some(Arity::from(values)), applies)),
+                                Some(explicits) => ControlFlow::Continue((Some(explicits.join(Arity::from(values))), applies)),
+                            };
+                        }
+                    } else if let Apply { operator, k: Continuation::Ref(k), .. } = e {
+                        if k == escape {
+                            if let Atom::CorePrimitive(operator) = operator {
+                                let out_arity = self.arities.get(&Binding::CorePrimitive(operator)).unwrap().1;
+                                return match explicits {
+                                    None => ControlFlow::Continue((Some(out_arity), applies)),
+                                    Some(explicits) => ControlFlow::Continue((Some(explicits.join(out_arity)), applies)),
+                                };
+                            } else if let Atom::Variable(x) = operator {
+                                applies.insert(*x);
+                            }
+                        }
+                    }
+                    ControlFlow::Continue((explicits, applies))
+                }).continue_value().unwrap());
+            } else if let LetContinuation { id, k: ContinuationDef { formals, .. }, .. } = e {
+                continues.insert(*id, Arity::from(formals));
+            }
+            ControlFlow::Continue(())
+        }).continue_value().unwrap();
+
+        let mut mid_lambdas = mid_lambdas.into_iter().collect::<Vec<_>>();
+        mid_lambdas.sort_by_key(|(_, (_, deps))| deps.len());
+        for (id, (base_arity, deps)) in mid_lambdas.into_iter() {
+            eprintln!("mid_lambda: id={}, arity={:?}, deps={:?}", id.0, base_arity, deps);
+            let dep_arity = deps.iter()
+                .map(|x| io_lambdas.get(x).map(|x| x.1).unwrap_or(Arity::Unknown))
+                .reduce(|acc, e| acc.join(e));
+            io_lambdas.entry(id)
+                .and_modify(|arity| arity.1 = match (base_arity, dep_arity) {
+                    (None, None) => Arity::Unknown,
+                    (None, Some(x)) | (Some(x), None) => x,
+                    (Some(a), Some(b)) => a.join(b),
+                });
+        }
+        self.arities.extend(io_lambdas.iter()
+            .map(|(id, arity)| (Binding::Variable(id.0), *arity)));
+
+        let k_arity = |k: &Continuation| match k {
+            Continuation::Ref(ContinuationRef::To(k)) => continues.get(k).copied(),
+            Continuation::Ref(_) => Some(Arity::Unknown),
+            Continuation::Def(ContinuationDef { formals, .. }) => Some(Arity::from(formals)),
+        };
+        match e.visit_mut(None, |_, e| {
+            if let Apply { operator, operands, kontract, k } = e {
+                match operator {
+                    Atom::Literal(_) => return ControlFlow::Break(Some(Error::InvalidApplication { operator: *operator })),
+                    Atom::Variable(x) => {
+                        let expected = io_lambdas.get(x).map(|a| a.0)
+                            .or_else(|| self.arities.get(&Binding::Variable(x.0)).map(|a| a.0))
+                            .unwrap_or(Arity::Unknown);
+                        let actual = Arity::from(&*operands);
+                        if !expected.compatible_with(actual) {
+                            return ControlFlow::Break(Some(Error::InvalidApplicationArity { operator: *operator, expected, actual }));
+                        }
+
+                        let actual = io_lambdas.get(x).map(|a| a.1)
+                            .or_else(|| self.arities.get(&Binding::Variable(x.0)).map(|a| a.1));
+                        if let Some(actual) = actual {
+                            if let Some(expected) = k_arity(k) {
+                                if !expected.compatible_with(actual) {
+                                    return ControlFlow::Break(Some(Error::InvalidContinuationArity { expected, actual }));
+                                }
+                            }
+                            *kontract = actual;
+                        }
+                    }
+                    Atom::CorePrimitive(s) => {
+                        let primitive_arity = self.arities.get(&Binding::CorePrimitive(s)).unwrap();
+                        let (expected, actual) = (primitive_arity.0, Arity::from(&*operands));
+                        if !expected.compatible_with(actual) {
+                            return ControlFlow::Break(Some(Error::InvalidApplicationArity { operator: *operator, expected, actual }));
+                        }
+                        let actual = primitive_arity.1;
+                        if actual != Arity::Unknown { // optimization of the core primitive will take care of this later
+                            if let Some(expected) = k_arity(k) {
+                                if !expected.compatible_with(actual) {
+                                    return ControlFlow::Break(Some(Error::InvalidContinuationArity { expected, actual }));
+                                }
+                            }
+                            *kontract = actual;
+                        }
+                    }
+                }
+            } else if let Continue { k, values } = e {
+                if let Some(expected) = k_arity(k) {
+                    let actual = Arity::from(&*values);
+                    if !expected.compatible_with(actual) {
+                        return ControlFlow::Break(Some(Error::InvalidContinuationArity { expected, actual }));
+                    }
+                }
+            } else if let Assign { vars, values, k } = e {
+                let expected = Arity::from(&*values);
+                let actual = Arity::from(&*vars);
+                if !expected.compatible_with(actual) {
+                    return ControlFlow::Break(Some(Error::InvalidContinuationArity { expected, actual }));
+                }
+                if let Some(expected) = k_arity(k) {
+                    let actual = Arity::Exact(0);
+                    if !expected.compatible_with(actual) {
+                        return ControlFlow::Break(Some(Error::InvalidContinuationArity { expected, actual }));
+                    }
+                }
+            }
+            ControlFlow::Continue(None)
+        }) {
+            ControlFlow::Break(Some(e)) => Err(e),
+            _ => Ok(()),
+        }
+    }
+
     fn optimize(&mut self, e: &mut Expression) -> Result<bool> {
         use Expression::*;
         match e {
             TakenOut => unreachable!(),
-            LetLiteral { id, body, .. } if !self.visible_bindings.contains(id) => {
+            LetLiteral { id, body, .. } if !self.binding_visible(id) => {
                 let uses = body.uses_variable(*id);
                 if uses == 0 {
                     *e = std::mem::take(body);
@@ -582,7 +595,7 @@ impl<'stx> Environment<'stx> {
                     Ok(false)
                 }
             },
-            LetLambda { id, val, body } if !self.visible_bindings.contains(id) => {
+            LetLambda { id, val, body } if !self.binding_visible(id) => {
                 let uses = body.uses_variable(*id);
                 let applies = body.visit(0, |count, e| match e {
                     Apply { operator: Atom::Variable(operator), .. } if operator == id => ControlFlow::Continue(count + 1),
@@ -862,10 +875,11 @@ impl<'stx> Environment<'stx> {
     }
 }
 
-pub fn transform(e: syntax::Expression, k: ContinuationRef, env: &syntax::Environment) -> Result<Expression> {
+pub fn transform(e: syntax::Expression, k: ContinuationRef, env: &mut CommonEnvironment) -> Result<Expression> {
     let mut env = Environment::from(env);
     let mut e = env.new_expression(e, Continuation::Ref(k));
-    e.check_arity()?;
+    eprintln!("unoptimized cps: {:#?}", e);
+    env.check_arity(&mut e)?;
 
     loop {
         let next = e.visit_mut(Ok(&mut env), |acc, e| {
@@ -878,9 +892,9 @@ pub fn transform(e: syntax::Expression, k: ContinuationRef, env: &syntax::Enviro
         });
         if next.is_break() {
             next.break_value().unwrap()?;
-            e.check_arity()?;
+            env.check_arity(&mut e)?;
         } else {
-            e.check_arity()?;
+            env.check_arity(&mut e)?;
             return Ok(e);
         }
     }
