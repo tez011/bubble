@@ -34,6 +34,11 @@ impl<T> From<&(Vec<T>, Option<ValueID>)> for Arity {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct ContinuationID(pub usize);
+impl From<ContinuationID> for ValueID {
+    fn from(value: ContinuationID) -> Self {
+        Self(value.0)
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
 pub enum ContinuationRef {
@@ -808,7 +813,7 @@ impl<'stx> Environment<'stx> {
                                 body: Box::new(Apply {
                                     operator: *operands.get(1).unwrap(),
                                     operands: (vec![], None),
-                                    kontract: Arity::AtLeast(0),
+                                    kontract: Arity::Unknown,
                                     k: Continuation::Def(ContinuationDef {
                                         formals: (vec![], Some(thunk_values)),
                                         body: Box::new(Apply {

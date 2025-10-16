@@ -1,3 +1,4 @@
+mod anf;
 mod core;
 mod cps;
 mod io;
@@ -35,6 +36,9 @@ fn main() {
         }
 
         let se = cps::transform(se, cps::ContinuationRef::Escape, &env).unwrap();
+        println!("cps: {:#?}", se);
+
+        let se = anf::transform(se, &env);
         println!("final form: {:#?}", se);
     }
 }
