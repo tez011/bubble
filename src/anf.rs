@@ -1,4 +1,4 @@
-use crate::core::Arity;
+use crate::common::Arity;
 use crate::cps;
 use crate::cps::{Atom, Continuation, ContinuationDef, ContinuationRef, ValueID};
 use crate::syntax;

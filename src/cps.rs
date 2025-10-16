@@ -1,4 +1,4 @@
-use crate::core::Arity;
+use crate::common::Arity;
 use crate::syntax;
 use crate::syntax::{LiteralC, LiteralD};
 use std::collections::{HashSet, HashMap};
@@ -245,7 +245,7 @@ impl Expression {
                     } else if let Apply { operator, k: Continuation::Ref(k), .. } = e {
                         if k == escape {
                             if let Atom::CorePrimitive(operator) = operator {
-                                let out_arity = crate::core::PRIMITIVES.get(operator).unwrap().1;
+                                let out_arity = crate::common::PRIMITIVES.get(operator).unwrap().1;
                                 return match explicits {
                                     None => ControlFlow::Continue((Some(out_arity), applies)),
                                     Some(explicits) => ControlFlow::Continue((Some(explicits.join(out_arity)), applies)),
@@ -302,7 +302,7 @@ impl Expression {
                         }
                     }
                     Atom::CorePrimitive(s) => {
-                        let primitive_arity = crate::core::PRIMITIVES.get(s).copied().unwrap();
+                        let primitive_arity = crate::common::PRIMITIVES.get(s).copied().unwrap();
                         let (expected, actual) = (primitive_arity.0, Arity::from(&*operands));
                         if !expected.compatible_with(actual) {
                             return ControlFlow::Break(Some(Error::InvalidApplicationArity { operator: *operator, expected, actual }));

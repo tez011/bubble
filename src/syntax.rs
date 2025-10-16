@@ -1,4 +1,4 @@
-use crate::core;
+use crate::common;
 use crate::io::InputPort;
 use std::borrow::Cow;
 use std::rc::Rc;
@@ -844,7 +844,7 @@ impl Environment {
             macros: std::collections::VecDeque::from(core_macros),
             bindings: [CoreForm::Lambda, CoreForm::If, CoreForm::Begin, CoreForm::SetValues, CoreForm::Quote, CoreForm::Quasiquote, CoreForm::Unquote, CoreForm::UnquoteSplicing, CoreForm::DefineValues].into_iter()
                 .map(|cf| (Cow::Borrowed(cf.as_str()), std::iter::once((ScopeSet::default(), Binding::CoreForm(cf))).collect()))
-                .chain(core::PRIMITIVES.iter().map(|(&name, _)| (Cow::Borrowed(name), std::iter::once((ScopeSet::default(), Binding::CorePrimitive(name))).collect())))
+                .chain(common::PRIMITIVES.iter().map(|(&name, _)| (Cow::Borrowed(name), std::iter::once((ScopeSet::default(), Binding::CorePrimitive(name))).collect())))
                 .chain(core_macro_names.iter().enumerate().map(|(i, &name)| (Cow::Borrowed(name), std::iter::once((ScopeSet::default(), Binding::SyntaxTransformer(i))).collect())))
                 .collect(),
             scope_counter: std::cell::Cell::new(1),
