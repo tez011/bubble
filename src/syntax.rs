@@ -1,4 +1,4 @@
-use crate::common;
+use crate::common::{Binding, CoreForm, Environment as CommonEnvironment};
 use crate::io::InputPort;
 use std::borrow::Cow;
 use std::rc::Rc;
@@ -133,42 +133,6 @@ impl std::fmt::Display for LiteralD {
     }
 }
 
-#[derive(Debug, Clone, Copy)]
-pub enum CoreForm {
-    Lambda,
-    If,
-    Begin,
-    SetValues,
-    Quote,
-    Quasiquote,
-    Unquote,
-    UnquoteSplicing,
-    DefineValues,
-}
-impl CoreForm {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            CoreForm::Lambda => "lambda",
-            CoreForm::If => "if",
-            CoreForm::Begin => "begin",
-            CoreForm::SetValues => "set-values!",
-            CoreForm::Quote => "quote",
-            CoreForm::Quasiquote => "quasiquote",
-            CoreForm::Unquote => "unquote",
-            CoreForm::UnquoteSplicing => "unquote-splicing",
-            CoreForm::DefineValues => "define-values",
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy)]
-pub enum Binding {
-    CoreForm(CoreForm),
-    CorePrimitive(&'static str),
-    SyntaxTransformer(usize),
-    Variable(usize),
-}
-
 #[derive(Debug, Clone)]
 pub struct Rules(pub Vec<(Pattern, Template)>);
 
@@ -195,11 +159,22 @@ pub enum Template {
 }
 
 #[derive(Debug)]
-pub struct Environment {
-    macros: std::collections::VecDeque<Rules>,
+struct Environment<'p> {
+    parent_env: &'p mut CommonEnvironment,
     bindings: std::collections::HashMap<std::borrow::Cow<'static, str>, std::collections::BTreeMap<ScopeSet, Binding>>,
     scope_counter: std::cell::Cell<usize>,
-    bound_id_counter: std::cell::Cell<usize>,
+}
+impl<'p> From<&'p mut CommonEnvironment> for Environment<'p> {
+    fn from(parent_env: &'p mut CommonEnvironment) -> Self {
+        let bindings = parent_env.toplevels.iter()
+            .map(|(name, binding)| (name.clone(), std::iter::once((ScopeSet::default(), *binding)).collect()))
+            .collect();
+        Self {
+            parent_env,
+            bindings,
+            scope_counter: std::cell::Cell::new(1),
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -837,40 +812,9 @@ impl std::fmt::Display for Rules {
     }
 }
 
-impl Environment {
-    pub fn new() -> Self {
-        let (core_macro_names, core_macros) = build_core_macros();
-        Self {
-            macros: std::collections::VecDeque::from(core_macros),
-            bindings: [CoreForm::Lambda, CoreForm::If, CoreForm::Begin, CoreForm::SetValues, CoreForm::Quote, CoreForm::Quasiquote, CoreForm::Unquote, CoreForm::UnquoteSplicing, CoreForm::DefineValues].into_iter()
-                .map(|cf| (Cow::Borrowed(cf.as_str()), std::iter::once((ScopeSet::default(), Binding::CoreForm(cf))).collect()))
-                .chain(common::PRIMITIVES.iter().map(|(&name, _)| (Cow::Borrowed(name), std::iter::once((ScopeSet::default(), Binding::CorePrimitive(name))).collect())))
-                .chain(core_macro_names.iter().enumerate().map(|(i, &name)| (Cow::Borrowed(name), std::iter::once((ScopeSet::default(), Binding::SyntaxTransformer(i))).collect())))
-                .collect(),
-            scope_counter: std::cell::Cell::new(1),
-            bound_id_counter: std::cell::Cell::new(1),
-        }
-    }
-
-    pub fn bound_names(&self) -> impl Iterator<Item = &str> {
-        self.bindings.iter().map(|(a, _)| a.as_ref())
-    }
-    pub fn bound_variables(&self) -> impl Iterator<Item = usize> {
-        self.bindings.iter().map(|(_, b)| b.values())
-            .flatten()
-            .filter_map(|b| if let Binding::Variable(v_id) = b { Some(*v_id) } else { None })
-    }
-    pub fn macro_rules(&self, name: &str) -> Option<&Rules> {
-        match self.bindings.get(name).and_then(|bindings| bindings.get(&Default::default())) {
-            Some(Binding::SyntaxTransformer(i)) => self.macros.get(*i),
-            _ => None,
-        }
-    }
-
-    pub fn new_variable(&self) -> usize {
-        let binding = self.bound_id_counter.get();
-        self.bound_id_counter.set(binding.wrapping_add(1));
-        binding
+impl<'p> Environment<'p> {
+    fn new_variable(&self) -> usize {
+        self.parent_env.new_variable()
     }
     fn new_scope(&self) -> usize {
         let scope = self.scope_counter.get();
@@ -1001,7 +945,7 @@ impl Environment {
                 Some(head) => self.resolve(head)?,
             };
             if let Some(Binding::SyntaxTransformer(index)) = head {
-                return self.macros.get(index).unwrap().0.iter()
+                return self.parent_env.macros.get(index).unwrap().0.iter()
                     .find_map(|(pattern, template)| pattern.try_match(&stx).map(|e| (e, template)))
                     .map(|(env, template)| {
                         let slice = env.iter().map(|(k, v)| (*k, v)).collect();
@@ -1123,10 +1067,10 @@ impl Environment {
     fn define_inner(&mut self, mut stx: Rc<SyntaxObject>) -> Result<Rc<SyntaxObject>, Error> {
         if let Some((name, patterns, templates)) = Self::parse_syntax_definition(stx.clone())? {
             match self.bindings.get_mut(name.as_ref()) {
-                Some(bb) => bb.insert(stx.scopes.clone(), Binding::SyntaxTransformer(self.macros.len())).map(|_| ()),
-                None => self.bindings.insert(name, std::iter::once((stx.scopes.clone(), Binding::SyntaxTransformer(self.macros.len()))).collect()).map(|_| ()),
+                Some(bb) => bb.insert(stx.scopes.clone(), Binding::SyntaxTransformer(self.parent_env.macros.len())).map(|_| ()),
+                None => self.bindings.insert(name, std::iter::once((stx.scopes.clone(), Binding::SyntaxTransformer(self.parent_env.macros.len()))).collect()).map(|_| ()),
             };
-            self.macros.push_back(Rules::from(patterns, templates));
+            self.parent_env.macros.push_back(Rules::from(patterns, templates));
             Ok(Rc::new(SyntaxObject::simple(Datum::Boolean(true), stx.source_location)))
         } else if let Some(matches) = VALUE_DEFINITION_PATTERN.try_match(&stx) {
             if let Some(MatchValue::Many(vs)) = matches.get("formals") {
@@ -1167,7 +1111,7 @@ impl Environment {
                     Some(bb) => bb,
                     None => self.bindings.entry(name.clone()).or_default(),
                 };
-                bindings.insert(body_scopes.clone(), Binding::SyntaxTransformer(self.macros.len() + i));
+                bindings.insert(body_scopes.clone(), Binding::SyntaxTransformer(self.parent_env.macros.len() + i));
             }
 
             let literals = match matches.get("literals") {
@@ -1206,7 +1150,7 @@ impl Environment {
                 return Err(Error::BadSyntax(stx));
             }
             for (patterns, templates) in std::iter::zip(patternses, templateses) {
-                self.macros.push_back(Rules::from(patterns, templates));
+                self.parent_env.macros.push_back(Rules::from(patterns, templates));
             }
 
             let mut bodys = vec![Rc::new(SyntaxObject::simple(Datum::Symbol(Cow::Borrowed("begin")), (0, 0)))];
@@ -1590,15 +1534,24 @@ impl Environment {
             },
         }
     }
+}
 
-    /******** top-level expander ********/
-    pub fn expand(&mut self, stx: SyntaxObject) -> Result<Expression, Error> {
-        let stx = self.expand_and_scope(Rc::new(stx))?;
-        let stx = self.define_inner(stx)?;
-        let stx = self.expand_and_scope(stx)?;
-        eprintln!("expanded: {}", stx);
-        self.resolve_syntax(&stx)
-    }
+/******** top-level expander ********/
+pub fn expand(stx: SyntaxObject, common_env: &mut CommonEnvironment) -> Result<Expression, Error> {
+    let mut env = Environment::from(common_env);
+    let stx = env.expand_and_scope(Rc::new(stx))?;
+    let stx = env.define_inner(stx)?;
+    let stx = env.expand_and_scope(stx)?;
+    eprintln!("expanded: {}", stx);
+
+    let e = env.resolve_syntax(&stx)?;
+    env.parent_env.bound_variables.extend(env.bindings.iter()
+        .map(|(_, b)| b.values())
+        .flatten()
+        .filter_map(|b| if let Binding::Variable(v_id) = b { Some(*v_id) } else { None }));
+    env.parent_env.toplevels.extend(env.bindings.into_iter()
+        .filter_map(|(name, bindings)| bindings.get(&ScopeSet::default()).map(|b| (name, *b))));
+    Ok(e)
 }
 
 /******** parser ********/
@@ -2391,7 +2344,7 @@ fn radix(port: &mut InputPort, offset: usize, base: i32) -> Result<Option<usize>
 }
 
 /******** built-in macros ********/
-fn build_core_macros() -> (Vec<&'static str>, Vec<Rules>) {
+pub(crate) fn core_macros() -> (Vec<&'static str>, Vec<Rules>) {
     [
         ("and", Rules(vec![
             (
