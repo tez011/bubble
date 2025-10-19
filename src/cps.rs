@@ -622,7 +622,7 @@ impl<'c> Environment<'c> {
                             ControlFlow::Continue(())
                         },
                         _ => ControlFlow::Continue(()),
-                    });
+                    }).continue_value().unwrap();
                     *e = std::mem::take(body);
                     Ok(true)
                 } else {
@@ -649,7 +649,7 @@ impl<'c> Environment<'c> {
                             ControlFlow::Continue(())
                         },
                         _ => ControlFlow::Continue(()),
-                    });
+                    }).continue_value().unwrap();
                     Ok(true)
                 } else {
                     Ok(false)

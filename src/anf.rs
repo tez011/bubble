@@ -2,6 +2,7 @@ use crate::common::{Arity, Environment as CommonEnvironment};
 use crate::cps;
 use crate::cps::{Atom, Continuation, ContinuationDef, ContinuationRef, ValueID};
 use crate::syntax;
+use std::collections::HashSet;
 use std::ops::ControlFlow;
 const BETA_EXPANSION_COMPLEXITY_THRESHOLD: usize = 11;
 
@@ -22,6 +23,7 @@ impl<'c> From<&'c CommonEnvironment> for Environment<'c> {
 #[derive(Debug, Clone)]
 pub struct Lambda {
     pub(crate) formals: (Vec<ValueID>, Option<ValueID>),
+    pub(crate) closed_env: Vec<ValueID>,
     pub(crate) body: Box<Expression>,
 }
 
@@ -29,6 +31,10 @@ pub struct Lambda {
 pub enum Rhs {
     Literal(syntax::LiteralD),
     Lambda(Lambda),
+    Closure { index: usize, closed_env: Vec<Atom> },
+}
+#[derive(Debug, Clone)]
+pub enum Rhses {
     Values { values: (Vec<Atom>, Option<ValueID>) },
     Apply { operator: Atom, operands: (Vec<Atom>, Option<ValueID>) },
 }
@@ -36,11 +42,12 @@ pub enum Rhs {
 #[derive(Debug, Clone, Default)]
 pub enum Expression {
     #[default] Nop,
-    Let { id: (Vec<ValueID>, Option<ValueID>), val: Rhs, body: Box<Expression> },
+    Let { id: ValueID, val: Rhs, body: Box<Expression> },
+    LetValues { ids: (Vec<ValueID>, Option<ValueID>), val: Rhses, body: Box<Expression> },
     Branch { test: Atom, consequent: Box<Expression>, alternate: Box<Expression> },
     Return { values: (Vec<Atom>, Option<ValueID>) },
     TailCall { to: ValueID, values: (Vec<Atom>, Option<ValueID>) },
-    Halt(bool),
+    Halt,
 }
 
 impl Expression {
@@ -54,7 +61,7 @@ impl Expression {
                     let r = visit_children(body.as_ref(), r, f)?;
                     f(r, body.as_ref())
                 },
-                Let { body, .. } => {
+                Let { body, .. } | LetValues { body, .. } => {
                     let r = visit_children(body.as_ref(), init, f)?;
                     f(r, body.as_ref())
                 },
@@ -64,7 +71,7 @@ impl Expression {
                     let r = visit_children(alternate.as_ref(), r, f)?;
                     f(r, alternate.as_ref())
                 },
-                Return { .. } | TailCall { .. } | Nop | Halt(_) => ControlFlow::Continue(init),
+                Return { .. } | TailCall { .. } | Nop | Halt => ControlFlow::Continue(init),
             }
         }
 
@@ -81,7 +88,7 @@ impl Expression {
                     let r = visit_children(body.as_mut(), r, f)?;
                     f(r, body.as_mut())
                 },
-                Let { body, .. } => {
+                Let { body, .. } | LetValues { body, .. } => {
                     let r = visit_children(body.as_mut(), init, f)?;
                     f(r, body.as_mut())
                 },
@@ -91,7 +98,7 @@ impl Expression {
                     let r = visit_children(alternate.as_mut(), r, f)?;
                     f(r, alternate.as_mut())
                 },
-                Return { .. } | TailCall { .. } | Nop | Halt(_) => ControlFlow::Continue(init),
+                Return { .. } | TailCall { .. } | Nop | Halt => ControlFlow::Continue(init),
             }
         }
 
@@ -103,31 +110,26 @@ impl Expression {
         self.visit(0, |count, _| ControlFlow::Continue(count + 1))
             .continue_value().unwrap()
     }
+
     fn count_uses(&self, target: ValueID) -> usize {
         self.visit(0, |count, e| {
             use Expression::*;
             ControlFlow::Continue(count + match e {
+                Let { .. } => 0,
+                LetValues { val, .. } => match val {
+                    Rhses::Values { values } => values.0.iter()
+                        .filter_map(|a| if let Atom::Variable(a) = a { Some(*a) } else { None })
+                        .chain(values.1.iter().copied())
+                        .filter(|&i| i == target).count(),
+                    Rhses::Apply { operator, operands } => std::iter::once(operator)
+                        .chain(operands.0.iter())
+                        .filter_map(|a| if let Atom::Variable(a) = a { Some(*a) } else { None })
+                        .chain(operands.1.iter().copied())
+                        .filter(|&i| i == target).count(),
+                },
                 Branch { test, .. } => match test {
                     Atom::Variable(test) => if target == *test { 1 } else { 0 },
                     _ => 0,
-                },
-                Let { id, val, .. } => {
-                    let lhs_uses = id.0.iter()
-                        .chain(id.1.iter())
-                        .filter(|&&i| i == target).count();
-                    let rhs_uses = match val {
-                        Rhs::Values { values } => values.0.iter()
-                            .filter_map(|a| if let Atom::Variable(a) = a { Some(*a) } else { None })
-                            .chain(values.1.iter().copied())
-                            .filter(|&i| i == target).count(),
-                        Rhs::Apply { operator, operands } => std::iter::once(operator)
-                            .chain(operands.0.iter())
-                            .filter_map(|a| if let Atom::Variable(a) = a { Some(*a) } else { None })
-                            .chain(operands.1.iter().copied())
-                            .filter(|&i| i == target).count(),
-                        _ => 0,
-                    };
-                    lhs_uses + rhs_uses
                 },
                 Return { values } | TailCall { values, .. } => {
                     values.0.iter()
@@ -135,10 +137,70 @@ impl Expression {
                         .chain(values.1.iter().copied())
                         .filter(|&i| i == target).count()
                 },
-                Nop | Halt(_) => 0,
+                Nop | Halt => 0,
             })
         }).continue_value().unwrap()
     }
+
+    /// Returns a tuple of (variables introduced, variables used).
+    fn variables(&self) -> (HashSet<ValueID>, HashSet<ValueID>) {
+        use Expression::*;
+        self.visit((HashSet::new(), HashSet::new()), |(mut intros, mut uses), e| {
+            match e {
+                Let { id, val, .. } => {
+                    intros.insert(*id);
+                    match val {
+                        Rhs::Literal(_) => (),
+                        Rhs::Lambda(Lambda { formals, closed_env, .. }) => {
+                            intros.extend(formals.0.iter().chain(formals.1.iter()).copied());
+                            uses.extend(closed_env.iter().copied());
+                        },
+                        Rhs::Closure { closed_env, .. } => {
+                            uses.extend(closed_env.iter()
+                                .filter_map(|a| if let Atom::Variable(i) = a { Some(*i) } else { None }));
+                        },
+                    };
+                }
+                LetValues { ids, val, .. } => {
+                    intros.extend(ids.0.iter().chain(ids.1.iter()).copied());
+                    match val {
+                        Rhses::Values { values } => {
+                            uses.extend(values.0.iter()
+                                .filter_map(|a| if let Atom::Variable(i) = a { Some(*i) } else { None })
+                                .chain(values.1.iter().copied()));
+                        },
+                        Rhses::Apply { operator, operands } => {
+                            uses.extend(operands.0.iter()
+                                .filter_map(|a| if let Atom::Variable(i) = a { Some(*i) } else { None })
+                                .chain(operands.1.iter().copied()));
+                            if let Atom::Variable(i) = operator {
+                                uses.insert(*i);
+                            }
+                        },
+                    }
+                },
+                Branch { test, .. } => {
+                    if let Atom::Variable(i) = test {
+                        uses.insert(*i);
+                    }
+                },
+                Return { values } => {
+                    uses.extend(values.0.iter()
+                        .filter_map(|a| if let Atom::Variable(i) = a { Some(*i) } else { None })
+                        .chain(values.1.iter().copied()));
+                }
+                TailCall { to, values } => {
+                    uses.insert(*to);
+                    uses.extend(values.0.iter()
+                        .filter_map(|a| if let Atom::Variable(i) = a { Some(*i) } else { None })
+                        .chain(values.1.iter().copied()));
+                }
+                Nop | Halt => (),
+            }
+            ControlFlow::Continue((intros, uses))
+        }).continue_value().unwrap()
+    }
+
     fn rename(&mut self, from: &(Vec<ValueID>, Option<ValueID>), to: &(Vec<Atom>, Option<ValueID>)) -> bool {
         assert!(from.0.len() <= to.0.len());
         let mapping = std::iter::zip(from.0.iter().copied(), to.0.iter().copied()).collect::<std::collections::HashMap<_, _>>();
@@ -192,12 +254,13 @@ impl Expression {
         self.visit_mut(false, |unchanged, e| {
             use Expression::*;
             ControlFlow::Continue(match e {
-                Let { val: Rhs::Values { values }, .. } => map_atoms(values),
-                Let { val: Rhs::Apply { operator, operands }, .. } => map_atom(operator) | map_atoms(operands),
+                Let { .. } => unchanged,
+                LetValues { val: Rhses::Values { values }, .. } => map_atoms(values),
+                LetValues { val: Rhses::Apply { operator, operands }, .. } => map_atom(operator) | map_atoms(operands),
                 Branch { test, .. } => map_atom(test),
                 Return { values } => map_atoms(values),
                 TailCall { to, values } => map_id(to) | map_atoms(values),
-                _ => unchanged,
+                Nop | Halt => unchanged,
             })
         }).continue_value().unwrap()
     }
@@ -233,52 +296,54 @@ impl<'stx> Environment<'stx> {
         use Expression::*;
         match e {
             cps::Expression::LetLiteral { id, val, body } => Let {
-                id: (vec![id.into()], None),
+                id,
                 val: Rhs::Literal(val),
                 body: Box::new(self.transform(*body)),
             },
             cps::Expression::LetLambda { id, val, body } => Let {
-                id: (vec![id.into()], None),
+                id,
                 val: Rhs::Lambda(Lambda {
                     formals: val.formals,
+                    closed_env: vec![],
                     body: Box::new(self.with_return(val.escape, |env| env.transform(*val.body))),
                 }),
                 body: Box::new(self.transform(*body)),
             },
             cps::Expression::LetContinuation { id, k, body } => Let {
-                id: (vec![id.into()], None),
+                id: id.into(),
                 val: Rhs::Lambda(Lambda {
                     formals: k.formals,
+                    closed_env: vec![],
                     body: Box::new(self.transform(*k.body)),
                 }),
                 body: Box::new(self.transform(*body)),
             },
             cps::Expression::Apply { operator, operands, k, kontract } => {
                 if self.is_escape(&k) {
-                    let id = self.new_variables(kontract);
-                    let values = (id.0.iter().copied().map(Atom::Variable).collect(), id.1);
-                    Let {
-                        id,
-                        val: Rhs::Apply { operator, operands },
+                    let ids = self.new_variables(kontract);
+                    let values = (ids.0.iter().copied().map(Atom::Variable).collect(), ids.1);
+                    LetValues {
+                        ids,
+                        val: Rhses::Apply { operator, operands },
                         body: Box::new(Return { values }),
                     }
                 } else if let Continuation::Def(ContinuationDef { formals, body }) = k {
-                    Let {
-                        id: formals,
-                        val: Rhs::Apply { operator, operands },
+                    LetValues {
+                        ids: formals,
+                        val: Rhses::Apply { operator, operands },
                         body: Box::new(self.transform(*body)),
                     }
                 } else if let Continuation::Ref(ContinuationRef::To(k)) = k {
-                    let id = self.new_variables(kontract);
-                    let values = (id.0.iter().copied().map(Atom::Variable).collect(), id.1);
-                    Let {
-                        id,
-                        val: Rhs::Apply { operator, operands },
+                    let ids = self.new_variables(kontract);
+                    let values = (ids.0.iter().copied().map(Atom::Variable).collect(), ids.1);
+                    LetValues {
+                        ids,
+                        val: Rhses::Apply { operator, operands },
                         body: Box::new(TailCall { to: k.into(), values }),
                     }
                 } else if let Continuation::Ref(k) = k {
                     if k == ContinuationRef::Abort {
-                        Halt(false)
+                        Halt
                     } else {
                         unreachable!()
                     }
@@ -302,7 +367,7 @@ impl<'stx> Environment<'stx> {
                     TailCall { to: k.into(), values }
                 } else if let Continuation::Ref(k) = k {
                     if k == ContinuationRef::Abort {
-                        Halt(false)
+                        Halt
                     } else {
                         unreachable!()
                     }
@@ -310,9 +375,9 @@ impl<'stx> Environment<'stx> {
                     unreachable!()
                 }
             }
-            cps::Expression::Assign { vars, values, k } => Let {
-                id: vars,
-                val: Rhs::Values { values },
+            cps::Expression::Assign { vars, values, k } => LetValues {
+                ids: vars,
+                val: Rhses::Values { values },
                 body: Box::new(if self.is_escape(&k) {
                     Return { values: (vec![], None) }
                 } else if let Continuation::Def(ContinuationDef { formals: _, body }) = k {
@@ -322,7 +387,7 @@ impl<'stx> Environment<'stx> {
                     TailCall { to: k.into(), values: (vec![], None) }
                 } else if let Continuation::Ref(k) = k {
                     if k == ContinuationRef::Abort {
-                        Halt(false)
+                        Halt
                     } else {
                         unreachable!()
                     }
@@ -334,14 +399,14 @@ impl<'stx> Environment<'stx> {
         }
     }
 
-    fn apply_primitive_to_literals(&mut self, operator: &'static str, operands: &Vec<Atom>) -> Option<Rhs> {
+    fn apply_primitive_to_literals(&mut self, operator: &'static str, operands: &Vec<Atom>) -> Option<Rhses> {
         match operator {
             "+" if operands.iter().all(|a| matches!(a, Atom::Literal(syntax::LiteralC::Integer(_)))) => {
                 let sum = operands.iter().map(|a| match a {
                     Atom::Literal(syntax::LiteralC::Integer(i)) => *i,
                     _ => unreachable!(),
                 }).reduce(|acc, x| acc + x).unwrap_or(0);
-                Some(Rhs::Values { values: (vec![Atom::Literal(syntax::LiteralC::Integer(sum))], None) })
+                Some(Rhses::Values { values: (vec![Atom::Literal(syntax::LiteralC::Integer(sum))], None) })
             },
             _ => None,
         }
@@ -352,8 +417,6 @@ impl<'stx> Environment<'stx> {
         eprintln!("anf::optimize: {:?}", e);
         match e {
             Let { id, val: Rhs::Literal(_), body } => {
-                if id.0.len() != 1 || id.1.is_some() { unreachable!(); }
-                let id = id.0.first_mut().unwrap();
                 if self.binding_visible(id) {
                     false
                 } else if body.count_uses(*id) == 0 {
@@ -363,19 +426,17 @@ impl<'stx> Environment<'stx> {
                     false
                 }
             },
-            Let { id, val: Rhs::Lambda(lambda), body } => {
-                if id.0.len() != 1 || id.1.is_some() { unreachable!(); }
-                let lambda_id = id.0.first_mut().unwrap();
+            Let { id: lambda_id, val: Rhs::Lambda(lambda), body } => {
                 let uses = body.count_uses(*lambda_id);
                 let applies = body.visit(0, |count: usize, e: &Expression| {
                     ControlFlow::Continue(count + match e {
-                        Let { val: Rhs::Apply { operator: Atom::Variable(operator), .. }, .. } => if lambda_id == operator { 1 } else { 0 },
+                        LetValues { val: Rhses::Apply { operator: Atom::Variable(operator), .. }, .. } => if lambda_id == operator { 1 } else { 0 },
                         TailCall { to, .. } => if lambda_id == to { 1 } else { 0 },
                         _ => 0,
                     })
                 }).continue_value().unwrap();
                 let is_recursive = match lambda.body.visit(false, |is_recursive, e| match e {
-                    Let { val: Rhs::Apply { operator: Atom::Variable(operator), .. }, .. } if lambda_id == operator => ControlFlow::Break(true),
+                    LetValues { val: Rhses::Apply { operator: Atom::Variable(operator), .. }, .. } if lambda_id == operator => ControlFlow::Break(true),
                     TailCall { to, .. } if lambda_id == to => ControlFlow::Break(true),
                     _ => ControlFlow::Continue(is_recursive),
                 }) {
@@ -389,15 +450,15 @@ impl<'stx> Environment<'stx> {
                     true
                 } else if uses == applies && !is_recursive && (applies == 1 || lambda.body.complexity() < BETA_EXPANSION_COMPLEXITY_THRESHOLD) {
                     body.visit_mut((), |_, e| match e {
-                        Let { id, val: Rhs::Apply { operator: Atom::Variable(operator), operands }, body } if lambda_id == operator => {
+                        LetValues { ids, val: Rhses::Apply { operator: Atom::Variable(operator), operands }, body } if lambda_id == operator => {
                             let mut n = *if applies == 1 { std::mem::take(&mut lambda.body) } else { lambda.body.clone() };
                             n.rename(&lambda.formals, &operands);
                             n.visit_mut((), |_, e| {
                                 if let Return { values } = e {
-                                    *e = Let { id: id.clone(), val: Rhs::Values { values: values.clone() }, body: body.clone() };
+                                    *e = LetValues { ids: ids.clone(), val: Rhses::Values { values: values.clone() }, body: body.clone() };
                                 }
                                 ControlFlow::Continue(())
-                            });
+                            }).continue_value().unwrap();
                             *e = n;
                             ControlFlow::Continue(())
                         },
@@ -408,26 +469,26 @@ impl<'stx> Environment<'stx> {
                             ControlFlow::Continue(())
                         },
                         _ => ControlFlow::Continue(()),
-                    });
+                    }).continue_value().unwrap();
                     *e = std::mem::take(body);
                     true
                 } else {
                     false
                 }
             },
-            Let { id, val: Rhs::Values { values }, body } => {
-                if id.0.iter().chain(id.1.iter()).all(|i| !self.binding_visible(i)) {
-                    body.rename(&id, &values);
+            LetValues { ids, val: Rhses::Values { values }, body } => {
+                if ids.0.iter().chain(ids.1.iter()).all(|i| !self.binding_visible(i)) {
+                    body.rename(&ids, &values);
                     *e = std::mem::take(body);
                     true
                 } else {
                     false
                 }
             },
-            Let { id, val: Rhs::Apply { operator: Atom::CorePrimitive(operator), operands: (operands, None) }, body } => {
+            LetValues { ids, val: Rhses::Apply { operator: Atom::CorePrimitive(operator), operands: (operands, None) }, body } => {
                 if let Some(val) = self.apply_primitive_to_literals(operator, operands) {
-                    *e = Let {
-                        id: std::mem::take(id),
+                    *e = LetValues {
+                        ids: std::mem::take(ids),
                         val,
                         body: std::mem::take(body),
                     };
@@ -459,4 +520,39 @@ pub fn transform(e: cps::Expression, env: &CommonEnvironment) -> Expression {
             eprintln!("*** optimize starting over");
         }
     }
+}
+
+pub fn convert_closures(mut e: Expression) -> Vec<Lambda> {
+    let mut lambdas = e.visit_mut(Vec::new(), |mut lambdas, e| {
+        use Expression::*;
+        if let Let { id, val: Rhs::Lambda(lambda), body } = e {
+            let (mut intros, uses) = lambda.body.variables();
+            intros.extend(lambda.formals.0.iter().chain(lambda.formals.1.iter()).copied());
+
+            let index = lambdas.len();
+            let closed_env = uses.difference(&intros).copied().collect::<Vec<_>>();
+            let n_e = Let {
+                id: *id,
+                val: Rhs::Closure { index, closed_env: closed_env.iter().copied().map(Atom::Variable).collect() },
+                body: std::mem::take(body),
+            };
+            lambdas.push(Lambda {
+                formals: std::mem::take(&mut lambda.formals),
+                closed_env,
+                body: std::mem::take(&mut lambda.body),
+            });
+            *e = n_e;
+        }
+        ControlFlow::Continue(lambdas)
+    }).continue_value().unwrap();
+
+    lambdas.push(Lambda {
+        formals: (vec![], None),
+        closed_env: {
+            let (intros, uses) = e.variables();
+            uses.difference(&intros).copied().collect::<Vec<_>>()
+        },
+        body: Box::new(e),
+    });
+    lambdas
 }

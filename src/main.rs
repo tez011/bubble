@@ -39,6 +39,9 @@ fn main() {
         println!("cps: {:#?}", se);
 
         let se = anf::transform(se, &env);
-        println!("final form: {:#?}", se);
+        println!("anf: {:#?}", se);
+
+        let cl = anf::convert_closures(se);
+        println!("closed: {:#?}", cl);
     }
 }
