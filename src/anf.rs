@@ -25,6 +25,7 @@ pub struct Lambda {
     pub(crate) formals: (Vec<ValueID>, Option<ValueID>),
     pub(crate) closed_env: Vec<ValueID>,
     pub(crate) body: Box<Expression>,
+    pub(crate) returns: Arity,
 }
 
 #[derive(Debug, Clone)]
@@ -200,6 +201,19 @@ impl Expression {
             ControlFlow::Continue((intros, uses))
         }).continue_value().unwrap()
     }
+    fn return_arity(&self) -> Arity {
+        use Expression::*;
+        self.visit(None, |arity: Option<Arity>, e| {
+            if let Return { values } = e {
+                ControlFlow::Continue(match arity {
+                    None => Some(Arity::from(values)),
+                    Some(arity) => Some(arity.join(Arity::from(values))),
+                })
+            } else {
+                ControlFlow::Continue(arity)
+            }
+        }).continue_value().unwrap().unwrap_or(Arity::Exact(0))
+    }
 
     fn rename(&mut self, from: &(Vec<ValueID>, Option<ValueID>), to: &(Vec<Atom>, Option<ValueID>)) -> bool {
         assert!(from.0.len() <= to.0.len());
@@ -300,14 +314,19 @@ impl<'stx> Environment<'stx> {
                 val: Rhs::Literal(val),
                 body: Box::new(self.transform(*body)),
             },
-            cps::Expression::LetLambda { id, val, body } => Let {
-                id,
-                val: Rhs::Lambda(Lambda {
-                    formals: val.formals,
-                    closed_env: vec![],
-                    body: Box::new(self.with_return(val.escape, |env| env.transform(*val.body))),
-                }),
-                body: Box::new(self.transform(*body)),
+            cps::Expression::LetLambda { id, val, body } => {
+                let lambda_body = self.with_return(val.escape, |env| env.transform(*val.body));
+                let returns = lambda_body.return_arity();
+                Let {
+                    id,
+                    val: Rhs::Lambda(Lambda {
+                        formals: val.formals,
+                        closed_env: vec![],
+                        body: Box::new(lambda_body),
+                        returns,
+                    }),
+                    body: Box::new(self.transform(*body)),
+                }
             },
             cps::Expression::LetContinuation { id, k, body } => Let {
                 id: id.into(),
@@ -315,6 +334,7 @@ impl<'stx> Environment<'stx> {
                     formals: k.formals,
                     closed_env: vec![],
                     body: Box::new(self.transform(*k.body)),
+                    returns: Arity::Exact(0),
                 }),
                 body: Box::new(self.transform(*body)),
             },
@@ -540,12 +560,14 @@ pub fn convert_closures(mut e: Expression) -> Vec<Lambda> {
                 formals: std::mem::take(&mut lambda.formals),
                 closed_env,
                 body: std::mem::take(&mut lambda.body),
+                returns: lambda.returns,
             });
             *e = n_e;
         }
         ControlFlow::Continue(lambdas)
     }).continue_value().unwrap();
 
+    let root_returns = e.return_arity();
     lambdas.push(Lambda {
         formals: (vec![], None),
         closed_env: {
@@ -553,6 +575,7 @@ pub fn convert_closures(mut e: Expression) -> Vec<Lambda> {
             uses.difference(&intros).copied().collect::<Vec<_>>()
         },
         body: Box::new(e),
+        returns: root_returns,
     });
     lambdas
 }

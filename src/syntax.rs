@@ -56,7 +56,6 @@ pub enum LiteralC {
     Rational(i64, i64),
     Float(f32),
     Character(char),
-    Symbol(&'static str),
 }
 impl PartialEq for LiteralC {
     fn eq(&self, other: &Self) -> bool {
@@ -66,7 +65,6 @@ impl PartialEq for LiteralC {
             (Self::Rational(l0, l1), Self::Rational(r0, r1)) => l0 == r0 && l1 == r1,
             (Self::Float(l0), Self::Float(r0)) => l0 == r0,
             (Self::Character(l0), Self::Character(r0)) => l0 == r0,
-            (Self::Symbol(l0), Self::Symbol(r0)) => l0 == r0,
             _ => false,
         }
     }
@@ -83,7 +81,6 @@ impl std::fmt::Display for LiteralC {
             LiteralC::Rational(n, d) => write!(f, "{}/{}", n, d),
             LiteralC::Float(x) => write!(f, "{}", x),
             LiteralC::Character(c) => write!(f, "#\\{}", c),
-            LiteralC::Symbol(s) => write!(f, "{}", s),
         }
     }
 }
@@ -91,6 +88,7 @@ impl std::fmt::Display for LiteralC {
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub enum LiteralD {
     #[default] Nil,
+    Static(&'static str),
     String(String),
     Bytes(Vec<u8>),
     Symbol(String),
@@ -101,6 +99,7 @@ impl std::fmt::Display for LiteralD {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             LiteralD::Nil => write!(f, "()"),
+            LiteralD::Static(s) => write!(f, "{}", s),
             LiteralD::String(s) => write!(f, "{:?}", s),
             LiteralD::Bytes(items) => {
                 write!(f, "#u8(")?;
@@ -340,7 +339,7 @@ impl SyntaxObject {
             (Datum::Character(e0), Literal::Copy(LiteralC::Character(e1))) => e0 == e1,
             (Datum::String(e0), Literal::NoCopy(LiteralD::String(e1))) => e0 == e1,
             (Datum::Symbol(e0), Literal::NoCopy(LiteralD::Symbol(e1))) => e0 == e1,
-            (Datum::Symbol(e0), Literal::Copy(LiteralC::Symbol(e1))) => e0 == e1,
+            (Datum::Symbol(e0), Literal::NoCopy(LiteralD::Static(e1))) => e0 == e1,
             (Datum::Bytes(e0), Literal::NoCopy(LiteralD::Bytes(e1))) => e0 == e1,
             (Datum::List | Datum::ImproperList | Datum::Vector | Datum::Quote | Datum::Quasiquote | Datum::Unquote | Datum::UnquoteSplicing, _) => &Literal::from(self) == e,
             _ => false,
@@ -401,7 +400,7 @@ impl From<&SyntaxObject> for Literal {
             Datum::Character(c) => LiteralC::Character(*c).into(),
             Datum::String(s) => LiteralD::String(s.clone()).into(),
             Datum::Bytes(items) => LiteralD::Bytes(items.clone()).into(),
-            Datum::Symbol(Cow::Borrowed(s)) => LiteralC::Symbol(s).into(),
+            Datum::Symbol(Cow::Borrowed(s)) => LiteralD::Static(s).into(),
             Datum::Symbol(Cow::Owned(s)) => LiteralD::Symbol(s.clone()).into(),
             Datum::List => {
                 if stx.children.len() == 0 {
@@ -410,10 +409,10 @@ impl From<&SyntaxObject> for Literal {
                 if let Datum::Symbol(name) = &stx.children.first().unwrap().e {
                     if stx.children.len() > 1 {
                         match name.as_ref() {
-                            "quote" => return LiteralD::List(vec![LiteralC::Symbol("quote").into(), stx.children[1].as_ref().into()], None).into(),
-                            "quasiquote" => return LiteralD::List(vec![LiteralC::Symbol("quasiquote").into(), stx.children[1].as_ref().into()], None).into(),
-                            "unquote" => return LiteralD::List(vec![LiteralC::Symbol("unquote").into(), stx.children[1].as_ref().into()], None).into(),
-                            "unquote-splicing" => return LiteralD::List(vec![LiteralC::Symbol("unquote-splicing").into(), stx.children[1].as_ref().into()], None).into(),
+                            "quote" => return LiteralD::List(vec![LiteralD::Static("quote").into(), stx.children[1].as_ref().into()], None).into(),
+                            "quasiquote" => return LiteralD::List(vec![LiteralD::Static("quasiquote").into(), stx.children[1].as_ref().into()], None).into(),
+                            "unquote" => return LiteralD::List(vec![LiteralD::Static("unquote").into(), stx.children[1].as_ref().into()], None).into(),
+                            "unquote-splicing" => return LiteralD::List(vec![LiteralD::Static("unquote-splicing").into(), stx.children[1].as_ref().into()], None).into(),
                             _ => (),
                         }
                     }
@@ -426,10 +425,10 @@ impl From<&SyntaxObject> for Literal {
                 LiteralD::List(children, tail).into()
             },
             Datum::Vector => LiteralD::Vector(stx.children.iter().map(|stx| stx.as_ref().into()).collect()).into(),
-            Datum::Quote => LiteralD::List(vec![LiteralC::Symbol("quote").into(), stx.children[0].as_ref().into()], None).into(),
-            Datum::Quasiquote => LiteralD::List(vec![LiteralC::Symbol("quasiquote").into(), stx.children[0].as_ref().into()], None).into(),
-            Datum::Unquote => LiteralD::List(vec![LiteralC::Symbol("unquote").into(), stx.children[0].as_ref().into()], None).into(),
-            Datum::UnquoteSplicing => LiteralD::List(vec![LiteralC::Symbol("unquote-splicing").into(), stx.children[0].as_ref().into()], None).into(),
+            Datum::Quote => LiteralD::List(vec![LiteralD::Static("quote").into(), stx.children[0].as_ref().into()], None).into(),
+            Datum::Quasiquote => LiteralD::List(vec![LiteralD::Static("quasiquote").into(), stx.children[0].as_ref().into()], None).into(),
+            Datum::Unquote => LiteralD::List(vec![LiteralD::Static("unquote").into(), stx.children[0].as_ref().into()], None).into(),
+            Datum::UnquoteSplicing => LiteralD::List(vec![LiteralD::Static("unquote-splicing").into(), stx.children[0].as_ref().into()], None).into(),
         }
     }
 }
@@ -1181,7 +1180,7 @@ impl<'p> Environment<'p> {
             Datum::Boolean(_) | Datum::Integer(_) | Datum::Rational(_, _) | Datum::Float(_) | Datum::Character(_) | Datum::String(_) | Datum::Symbol(_) | Datum::Bytes(_) | Datum::Quote | Datum::Vector => Ok(Expression::Literal(stx.as_ref().into())),
             Datum::Quasiquote => Ok(Expression::ProcedureCall {
                 operator: Box::new(Expression::CorePrimitive("list")),
-                operands: vec![LiteralC::Symbol("quasiquote").into(),
+                operands: vec![LiteralD::Static("quasiquote").into(),
                     self.qquote_syntax(stx.children.first().unwrap(), depth + 1)?],
             }),
             Datum::Unquote => if depth == 1 {
@@ -1189,7 +1188,7 @@ impl<'p> Environment<'p> {
             } else {
                 Ok(Expression::ProcedureCall {
                     operator: Box::new(Expression::CorePrimitive("list")),
-                    operands: vec![LiteralC::Symbol("unquote").into(),
+                    operands: vec![LiteralD::Static("unquote").into(),
                         self.qquote_syntax(stx.children.first().unwrap(), depth - 1)?],
                 })
             },
@@ -1198,7 +1197,7 @@ impl<'p> Environment<'p> {
             } else {
                 Ok(Expression::ProcedureCall {
                     operator: Box::new(Expression::CorePrimitive("list")),
-                    operands: vec![LiteralC::Symbol("unquote-splicing").into(),
+                    operands: vec![LiteralD::Static("unquote-splicing").into(),
                         self.qquote_syntax(stx.children.first().unwrap(), depth - 1)?],
                 })
             },
@@ -1250,7 +1249,7 @@ impl<'p> Environment<'p> {
                         None => Err(Error::BadCoreFormSyntax(CoreForm::Quasiquote, stx.clone())),
                         Some(stx) => Ok(Expression::ProcedureCall {
                             operator: Box::new(Expression::CorePrimitive("list")),
-                            operands: vec![LiteralC::Symbol("quasiquote").into(), self.qquote_syntax(stx.children.first().unwrap(), depth + 1)?],
+                            operands: vec![LiteralD::Static("quasiquote").into(), self.qquote_syntax(stx.children.first().unwrap(), depth + 1)?],
                         }),
                     },
                     Some(Binding::CoreForm(CoreForm::Unquote)) => match stx.children.get(1) {
@@ -1260,7 +1259,7 @@ impl<'p> Environment<'p> {
                         } else {
                             Ok(Expression::ProcedureCall {
                                 operator: Box::new(Expression::CorePrimitive("list")),
-                                operands: vec![LiteralC::Symbol("unquote").into(), self.qquote_syntax(stx, depth - 1)?],
+                                operands: vec![LiteralD::Static("unquote").into(), self.qquote_syntax(stx, depth - 1)?],
                             })
                         },
                     },
@@ -1271,7 +1270,7 @@ impl<'p> Environment<'p> {
                         } else {
                             Ok(Expression::ProcedureCall {
                                 operator: Box::new(Expression::CorePrimitive("list")),
-                                operands: vec![LiteralC::Symbol("unquote-splicing").into(), self.qquote_syntax(stx, depth - 1)?],
+                                operands: vec![LiteralD::Static("unquote-splicing").into(), self.qquote_syntax(stx, depth - 1)?],
                             })
                         },
                     },
