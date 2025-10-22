@@ -53,7 +53,6 @@ pub enum LiteralC {
     #[default] Nil,
     Boolean(bool),
     Integer(i64),
-    Rational(i64, i64),
     Float(f32),
     Character(char),
 }
@@ -62,7 +61,6 @@ impl PartialEq for LiteralC {
         match (self, other) {
             (Self::Boolean(l0), Self::Boolean(r0)) => l0 == r0,
             (Self::Integer(l0), Self::Integer(r0)) => l0 == r0,
-            (Self::Rational(l0, l1), Self::Rational(r0, r1)) => l0 == r0 && l1 == r1,
             (Self::Float(l0), Self::Float(r0)) => l0 == r0,
             (Self::Character(l0), Self::Character(r0)) => l0 == r0,
             _ => false,
@@ -78,7 +76,6 @@ impl std::fmt::Display for LiteralC {
             LiteralC::Boolean(true) => write!(f, "#t"),
             LiteralC::Boolean(false) => write!(f, "#f"),
             LiteralC::Integer(i) => write!(f, "{}", i),
-            LiteralC::Rational(n, d) => write!(f, "{}/{}", n, d),
             LiteralC::Float(x) => write!(f, "{}", x),
             LiteralC::Character(c) => write!(f, "#\\{}", c),
         }
@@ -240,7 +237,6 @@ enum TokenTag {
 enum Datum {
     Boolean(bool),
     Integer(i64),
-    Rational(i64, i64),
     Float(f32),
     Character(char),
     String(String),
@@ -334,7 +330,6 @@ impl SyntaxObject {
         match (&self.e, e) {
             (Datum::Boolean(e0), Literal::Copy(LiteralC::Boolean(e1))) => e0 == e1,
             (Datum::Integer(e0), Literal::Copy(LiteralC::Integer(e1))) => e0 == e1,
-            (Datum::Rational(e0, e2), Literal::Copy(LiteralC::Rational(e1, e3))) => e0 == e1 && e2 == e3,
             (Datum::Float(e0), Literal::Copy(LiteralC::Float(e1))) => e0 == e1,
             (Datum::Character(e0), Literal::Copy(LiteralC::Character(e1))) => e0 == e1,
             (Datum::String(e0), Literal::NoCopy(LiteralD::String(e1))) => e0 == e1,
@@ -352,7 +347,6 @@ impl std::fmt::Display for SyntaxObject {
             Datum::Boolean(true) => write!(f, "#t"),
             Datum::Boolean(false) => write!(f, "#f"),
             Datum::Integer(i) => write!(f, "{}", i),
-            Datum::Rational(n, d) => write!(f, "{}/{}", n, d),
             Datum::Float(fl) => write!(f, "{}", fl),
             Datum::Character(c) => write!(f, "#\\{}", c),
             Datum::String(s) => write!(f, "\"{}\"", s),
@@ -395,7 +389,6 @@ impl From<&SyntaxObject> for Literal {
         match &stx.e {
             Datum::Boolean(b) => LiteralC::Boolean(*b).into(),
             Datum::Integer(i) => LiteralC::Integer(*i).into(),
-            Datum::Rational(n, d) => LiteralC::Rational(*n, *d).into(),
             Datum::Float(f) => LiteralC::Float(*f).into(),
             Datum::Character(c) => LiteralC::Character(*c).into(),
             Datum::String(s) => LiteralD::String(s.clone()).into(),
@@ -558,7 +551,7 @@ impl<'a> Pattern {
         match &stx.e {
             Datum::Symbol(s) if s == "_" => Ok(Pattern::Underscore),
             Datum::Symbol(s) => if literals.contains(s.as_ref()) { Ok(Pattern::Literal(s.clone())) } else { Ok(Pattern::Variable(s.clone())) },
-            Datum::Boolean(_) | Datum::Integer(_) | Datum::Rational(..) | Datum::Character(_) | Datum::Float(_) | Datum::String(_) | Datum::Bytes(_) => Ok(Pattern::Constant(stx.as_ref().into())),
+            Datum::Boolean(_) | Datum::Integer(_) | Datum::Character(_) | Datum::Float(_) | Datum::String(_) | Datum::Bytes(_) => Ok(Pattern::Constant(stx.as_ref().into())),
             Datum::List => Ok(Pattern::List(Self::from_sequence(&stx.children, literals)?)),
             Datum::Vector => Ok(Pattern::Vector(Self::from_sequence(&stx.children, literals)?)),
             Datum::ImproperList => Ok(Pattern::ImproperList(
@@ -1177,7 +1170,7 @@ impl<'p> Environment<'p> {
 
     fn qquote_syntax(&self, stx: &Rc<SyntaxObject>, depth: usize) -> Result<Expression, Error> {
         match &stx.e {
-            Datum::Boolean(_) | Datum::Integer(_) | Datum::Rational(_, _) | Datum::Float(_) | Datum::Character(_) | Datum::String(_) | Datum::Symbol(_) | Datum::Bytes(_) | Datum::Quote | Datum::Vector => Ok(Expression::Literal(stx.as_ref().into())),
+            Datum::Boolean(_) | Datum::Integer(_) | Datum::Float(_) | Datum::Character(_) | Datum::String(_) | Datum::Symbol(_) | Datum::Bytes(_) | Datum::Quote | Datum::Vector => Ok(Expression::Literal(stx.as_ref().into())),
             Datum::Quasiquote => Ok(Expression::ProcedureCall {
                 operator: Box::new(Expression::CorePrimitive("list")),
                 operands: vec![LiteralD::Static("quasiquote").into(),
@@ -1360,7 +1353,7 @@ impl<'p> Environment<'p> {
     }
     fn resolve_syntax(&self, stx: &Rc<SyntaxObject>) -> Result<Expression, Error> {
         match &stx.e {
-            Datum::Boolean(_) | Datum::Integer(_) | Datum::Rational(_, _) | Datum::Float(_) | Datum::Character(_) | Datum::String(_) | Datum::Bytes(_) | Datum::Vector => Ok(Expression::Literal(stx.as_ref().into())),
+            Datum::Boolean(_) | Datum::Integer(_) | Datum::Float(_) | Datum::Character(_) | Datum::String(_) | Datum::Bytes(_) | Datum::Vector => Ok(Expression::Literal(stx.as_ref().into())),
             Datum::Quote => Ok(Expression::Literal(stx.children[0].as_ref().into())),
             Datum::Quasiquote => self.qquote_syntax(stx.children.first().unwrap(), 1),
             Datum::Unquote | Datum::UnquoteSplicing => Err(Error::BadSyntax(stx.clone())),
@@ -1677,24 +1670,8 @@ fn parse_number(fs: String, st: TokenTag) -> Result<Datum, Error> {
                     _ => Err(Error::InvalidNumber("illegal number")),
                 }
             }
-        }
-        TokenTag::Rational => {
-            let mut parts = s.splitn(2, '/');
-            if let (Some(nstr), Some(dstr)) = (parts.next(), parts.next()) {
-                match (i64::from_str_radix(nstr.trim(), radix), i64::from_str_radix(dstr.trim(), radix)) {
-                    (Ok(n), Ok(d)) => {
-                        if d == 0 {
-                            Err(Error::InvalidNumber("division by zero"))
-                        } else {
-                            Ok(Datum::Rational(sign * n, d))
-                        }
-                    },
-                    _ => Err(Error::InvalidNumber("illegal number")),
-                }
-            } else {
-                Err(Error::InvalidNumber("illegal number"))
-            }
-        }
+        },
+        TokenTag::Rational => Err(Error::InvalidNumber("rationals not supported")),
         TokenTag::Decimal => match s.parse::<f32>() {
             Ok(f) => Ok(Datum::Float(sign as f32 * f)),
             Err(_) => Err(Error::InvalidNumber("illegal number")),
