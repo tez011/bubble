@@ -16,7 +16,7 @@ pub enum Expression {
     Core(&'static str),
     Call { operator: Box<Located<Expression>>, operands: Vec<Located<Expression>> },
     Lambda { formals: (Vec<Located<usize>>, Option<Located<usize>>), body: Vec<Located<Expression>> },
-    If { test: Box<Located<Expression>>, consequent: Box<Located<Expression>>, alternate: Option<Box<Located<Expression>>> },
+    Conditional { test: Box<Located<Expression>>, consequent: Box<Located<Expression>>, alternate: Option<Box<Located<Expression>>> },
     Assign { ids: (Vec<Located<usize>>, Option<Located<usize>>), values: Box<Located<Expression>> },
     Block { body: Vec<Located<Expression>> },
 }
@@ -49,7 +49,7 @@ impl std::fmt::Display for Expression {
         match self {
             Literal(literal) => match literal {
                 super::Literal::Copy(LiteralC::Nil) => write!(f, "'{}", literal),
-                super::Literal::NoCopy(LiteralD::Nil | LiteralD::Symbol(_) | LiteralD::List(..)) => write!(f, "'{}", literal),
+                super::Literal::NoCopy(LiteralD::Static(_) | LiteralD::Symbol(_) | LiteralD::List(..)) => write!(f, "'{}", literal),
                 _ => write!(f, "{}", literal),
             },
             Variable(i) => write!(f, "x{}", i),
@@ -68,7 +68,7 @@ impl std::fmt::Display for Expression {
                 }
                 write!(f, ")")
             },
-            If { test, consequent, alternate } => {
+            Conditional { test, consequent, alternate } => {
                 write!(f, "(if {} {}", &***test, &***consequent)?;
                 if let Some(alternate) = alternate {
                     write!(f, " {}", &***alternate)?;
@@ -678,7 +678,9 @@ struct Environment<'p> {
 impl<'p> From<&'p mut frontend::Environment> for Environment<'p> {
     fn from(parent_env: &'p mut frontend::Environment) -> Self {
         let bindings = parent_env.toplevels.iter()
-            .map(|(name, binding)| (name.clone(), std::iter::once((ScopeSet::default(), *binding)).collect()))
+            .map(|(name, binding)| (name.clone(), *binding))
+            .chain(CoreForm::all().iter().copied().map(|cf| (Cow::Borrowed(cf.as_str()), Binding::CoreForm(cf))))
+            .map(|(name, binding)| (name, std::iter::once((ScopeSet::default(), binding)).collect()))
             .collect();
         Self {
             parent_env,
@@ -1047,7 +1049,7 @@ impl<'p> Environment<'p> {
             } else {
                 Err(format!("lambda: bad syntax: {}", stx))
             },
-            If => Ok(Expression::If {
+            If => Ok(Expression::Conditional {
                 test: Box::new(self.resolve_syntax(stx.children.get(1).ok_or_else(|| format!("bad syntax: {}", stx))?)?),
                 consequent: Box::new(self.resolve_syntax(stx.children.get(2).ok_or_else(|| format!("bad syntax: {}", stx))?)?),
                 alternate: stx.children.get(3).map(|stx| self.resolve_syntax(stx)).transpose()?.map(Box::new),
@@ -1211,10 +1213,6 @@ pub fn expand(stx: Object, env: &mut frontend::Environment) -> Result<Located<Ex
     let stx = env.add_binding_scopes(stx)?;
     let e = env.resolve_syntax(&stx)?;
 
-    env.parent_env.bound_variables.extend(env.bindings.iter()
-        .map(|(_, b)| b.values())
-        .flatten()
-        .filter(|b| matches!(b, Binding::Variable(_))));
     env.parent_env.toplevels.extend(env.bindings.into_iter()
         .filter_map(|(name, bindings)| bindings.get(&ScopeSet::default()).map(|b| (name, *b))));
     Ok(e)

@@ -7,6 +7,11 @@ fn main() {
         let stx = bubble::compiler::read_syntax(&mut handle).unwrap();
         println!("raw: {}", stx);
         let stx = bubble::compiler::expand_syntax(stx, &mut env).unwrap();
-        println!("final: {}", stx);
+        println!("expanded: {}", stx);
+        let e = bubble::compiler::normalize_syntax(stx, &mut env).unwrap();
+        println!("final:");
+        for lambda in e {
+            println!("{}", lambda);
+        }
     }
 }

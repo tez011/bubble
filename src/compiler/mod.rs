@@ -1,7 +1,10 @@
 mod frontend;
+mod normalize;
 mod syntax;
 
 pub use frontend::{Environment as FrontendEnvironment};
+pub use normalize::anf::{Expression, Lambda};
+pub use normalize::{normalize as normalize_syntax};
 pub use syntax::{expand as expand_syntax, read as read_syntax};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -29,6 +32,15 @@ impl Arity {
         }
     }
 }
+impl std::fmt::Display for Arity {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Arity::Exact(n) => write!(f, "exactly {}", n),
+            Arity::AtLeast(n) => write!(f, "at least {}", n),
+            Arity::Unknown => write!(f, "unknown"),
+        }
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Binding {
@@ -36,6 +48,36 @@ pub enum Binding {
     CorePrimitive(&'static str),
     SyntaxTransformer(usize),
     Variable(usize),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct ValueID(usize);
+impl ValueID {
+    pub fn invalid() -> Self {
+        ValueID(0)
+    }
+}
+impl TryFrom<Binding> for ValueID {
+    type Error = ();
+    fn try_from(value: Binding) -> Result<Self, Self::Error> {
+        match value {
+            Binding::Variable(i) => Ok(Self(i)),
+            _ => Err(()),
+        }
+    }
+}
+impl<T> From<&(Vec<T>, Option<ValueID>)> for Arity {
+    fn from(value: &(Vec<T>, Option<ValueID>)) -> Self {
+        match value.1 {
+            None => Arity::Exact(value.0.len()),
+            Some(_) => Arity::AtLeast(value.0.len()),
+        }
+    }
+}
+impl std::fmt::Display for ValueID {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "x{}", self.0)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -57,9 +99,8 @@ pub enum LiteralC {
     Character(char),
 }
 impl Eq for LiteralC { }
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum LiteralD {
-    #[default] Nil,
     Static(&'static str),
     String(String),
     Bytes(Vec<u8>),
@@ -108,7 +149,6 @@ impl std::fmt::Display for LiteralC {
 impl std::fmt::Display for LiteralD {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            LiteralD::Nil => write!(f, "()"),
             LiteralD::Static(s) => write!(f, "{}", s),
             LiteralD::String(s) => write!(f, "{:?}", s),
             LiteralD::Bytes(items) => {
@@ -138,6 +178,33 @@ impl std::fmt::Display for LiteralD {
                 }
                 write!(f, ")")
             }
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Atom {
+    Literal(LiteralC),
+    Variable(ValueID),
+    Core(&'static str),
+}
+impl std::fmt::Display for Atom {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        use Atom::*;
+        match self {
+            Literal(LiteralC::Nil) => write!(f, "'()"),
+            Literal(x) => std::fmt::Display::fmt(&x, f),
+            Variable(x) => std::fmt::Display::fmt(&x, f),
+            Core(x) => std::fmt::Display::fmt(&x, f),
+        }
+    }
+}
+impl From<Atom> for Binding {
+    fn from(atom: Atom) -> Self {
+        match atom {
+            Atom::Literal(_) => panic!(),
+            Atom::Variable(ValueID(x)) => Binding::Variable(x),
+            Atom::Core(s) => Binding::CorePrimitive(s),
         }
     }
 }
@@ -172,6 +239,7 @@ impl<T> Located<T> {
         Located { item, location }
     }
 }
+impl<T: Copy> Copy for Located<T> { }
 impl<T> From<T> for Located<T> {
     fn from(item: T) -> Self {
         Self::new(item, Default::default())

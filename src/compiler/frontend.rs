@@ -1,6 +1,6 @@
 use std::borrow::Cow;
-use std::collections::{HashMap, HashSet};
-use super::{Arity, Binding};
+use std::collections::HashMap;
+use super::{Arity, Binding, ValueID};
 use super::syntax;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -47,9 +47,9 @@ impl CoreForm {
 pub struct Environment {
     pub macros: Vec<syntax::Rules>,
     pub toplevels: HashMap<Cow<'static, str>, Binding>,
-    pub(super) bound_variables: HashSet<Binding>,
     pub(super) arities: HashMap<Binding, (Arity, Arity)>,
     pub(super) bound_id_counter: std::cell::Cell<usize>,
+    pub(super) literals: HashMap<ValueID, std::rc::Rc<super::LiteralD>>,
 }
 impl Environment {
     pub fn new() -> Self {
@@ -62,11 +62,11 @@ impl Environment {
                 .chain(core_primitives.iter().copied().map(|(name, _)| (Cow::Borrowed(name), Binding::CorePrimitive(name))))
                 .chain(core_macro_names.iter().copied().enumerate().map(|(i, s)| (Cow::Borrowed(s), Binding::SyntaxTransformer(i))))
                 .collect(),
-            bound_variables: Default::default(),
             arities: core_primitives.iter().copied()
                 .map(|(name, arity)| (Binding::CorePrimitive(name), arity))
                 .collect(),
             bound_id_counter: std::cell::Cell::new(1),
+            literals: Default::default(),
         }
     }
 
