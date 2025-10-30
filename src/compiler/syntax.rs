@@ -833,7 +833,12 @@ impl<'p> Environment<'p> {
                 }
             }
 
-            stx.children.first_mut().unwrap().e = ObjectT::Symbol(Cow::Borrowed(CoreForm::SetValues.as_str()));
+            let Some(MatchValue::One(values)) = matches.get("values") else { panic!() };
+            assert!(std::ptr::eq(*values, stx.children.get(2).unwrap()));
+            let values = std::mem::take(&mut stx.children.get_mut(2).unwrap().children).into_iter()
+                .map(|stx| self.parse_definitions(stx))
+                .collect::<Result<Vec<_>, _>>()?;
+            stx.children.get_mut(2).unwrap().children = values;
             Ok(stx)
         } else if let Some(matches) = SYNTAX_BINDING_PATTERN.try_match(&stx) {
             let bind_scope = self.new_scope();
@@ -1058,7 +1063,7 @@ impl<'p> Environment<'p> {
                 .map(|stx| self.resolve_syntax(stx))
                 .collect::<Result<Vec<_>, _>>()
                 .map(|body| Expression::Block { body }.at(stx.location)),
-            SetValues => Ok(Expression::Assign {
+            SetValues | DefineValues => Ok(Expression::Assign {
                 ids: create_ids(stx.children.get(1).ok_or_else(|| format!("bad syntax: {}", stx))?)?,
                 values: Box::new(self.resolve_syntax(stx.children.get(2).ok_or_else(|| format!("bad syntax: {}", stx))?)?),
             }.at(stx.location)),
@@ -2094,7 +2099,7 @@ static SYNTAX_DEFINITION_PATTERN: std::sync::LazyLock<Pattern> = std::sync::Lazy
 static VALUE_DEFINITION_PATTERN: std::sync::LazyLock<Pattern> = std::sync::LazyLock::new(|| Pattern::List(vec![
     Pattern::Literal(Cow::Borrowed("define-values")),
     Pattern::Variable(Cow::Borrowed("formals")),
-    Pattern::Variable(Cow::Borrowed("expression")),
+    Pattern::Variable(Cow::Borrowed("values")),
 ]));
 static SYNTAX_BINDING_PATTERN: std::sync::LazyLock<Pattern> = std::sync::LazyLock::new(|| Pattern::ImproperList(vec![
     Pattern::Literal(Cow::Borrowed("letrec-syntax")),

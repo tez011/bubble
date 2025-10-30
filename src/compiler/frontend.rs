@@ -13,8 +13,9 @@ pub enum CoreForm {
     Quasiquote,
     Unquote,
     UnquoteSplicing,
+    DefineValues,
 }
-static CORE_FORM_ALL: [CoreForm; 8] = {
+static CORE_FORM_ALL: [CoreForm; 9] = {
     use CoreForm::*;
     [
         Lambda,
@@ -25,10 +26,11 @@ static CORE_FORM_ALL: [CoreForm; 8] = {
         Quasiquote,
         Unquote,
         UnquoteSplicing,
+        DefineValues,
     ]
 };
 impl CoreForm {
-    pub(super) fn all() -> [CoreForm; 8] { CORE_FORM_ALL }
+    pub(super) fn all() -> [CoreForm; 9] { CORE_FORM_ALL }
     pub(super) fn as_str(self) -> &'static str {
         match self {
             CoreForm::Lambda => "lambda",
@@ -39,6 +41,7 @@ impl CoreForm {
             CoreForm::Quasiquote => "quasiquote",
             CoreForm::Unquote => "unquote",
             CoreForm::UnquoteSplicing => "unquote-splicing",
+            CoreForm::DefineValues => "define-values",
         }
     }
 }
