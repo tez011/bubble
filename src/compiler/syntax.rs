@@ -125,8 +125,8 @@ impl Object {
         self.children = children;
         self
     }
-    fn with_scopes(mut self, scopes: ScopeSet) -> Self {
-        self.scopes = scopes;
+    fn with_scopes(mut self, scopes: &ScopeSet) -> Self {
+        scopes.iter().copied().for_each(|scope| self.add_scope(scope));
         self
     }
     fn with_source(mut self, location: Location) -> Self {
@@ -532,7 +532,9 @@ impl<'a> Template {
         Ok(templates)
     }
 
-    fn count_ellipsis_reps(&self, env: &MatchSlice) -> Result<usize, String> {
+    /// Returns the number of times that ellipsis variables needs to be expanded in a template,
+    /// or `Err(())` if there's a mismatch and the template cannot be expanded with these match values.
+    fn count_ellipsis_reps(&self, env: &MatchSlice) -> Result<usize, ()> {
         use Template::*;
         let mut queue = std::iter::once(self).collect::<std::collections::VecDeque<_>>();
         let mut reps = None;
@@ -542,7 +544,7 @@ impl<'a> Template {
                 Identifier(template) => match env.get(template.as_ref()) {
                     Some(MatchValue::Many(vs)) => {
                         if reps.is_some_and(|reps| reps != vs.len()) {
-                            return Err(format!("syntax-rules: mismatched ellipsis in template"));
+                            return Err(());
                         } else if reps.is_none() {
                             reps.replace(vs.len());
                         }
@@ -557,51 +559,54 @@ impl<'a> Template {
         }
         Ok(reps.unwrap_or(0))
     }
-    fn apply(&self, env: &MatchSlice, stx: &Object, expand_scope: Scope) -> Result<Object, String> {
+
+    /// Apply a pattern match to a template to produce a new syntax object.
+    /// Returns `Err(())` if the pattern match did not fit the template.
+    fn apply(&self, env: &MatchSlice, expand_scope: Scope) -> Result<Object, ()> {
         use Template::*;
         match self {
             Constant(stx) => Ok(stx.clone()),
             Identifier(template) => match env.get(template.as_ref()) {
                 Some(MatchValue::One(stx)) => Ok(Object::clone(stx)),
-                Some(MatchValue::Many(_)) => Err(format!("syntax-rules: bad macro template: {} should have an ellipsis", template.as_ref())),
+                Some(MatchValue::Many(_)) => panic!(), // caused by ellipsis mismatch; should be caught earlier
                 None => Ok(Object {
                     e: ObjectT::Symbol(template.clone()),
                     children: vec![],
-                    scopes: stx.scopes.iter().copied().chain(std::iter::once(expand_scope)).collect(),
-                    location: stx.location,
+                    scopes: std::iter::once(expand_scope).collect(),
+                    location: Default::default(),
                 }),
             },
             Ellipsis(_) => panic!(),
             List(templates) => Ok(Object {
                 e: ObjectT::List,
-                children: Self::apply_sequence(templates, env, stx, expand_scope)?,
+                children: Self::apply_sequence(templates, env, expand_scope)?,
                 scopes: Default::default(),
-                location: stx.location,
+                location: Default::default(),
             }),
             ImproperList(templates, tail) => Ok(Object {
                 e: ObjectT::List,
-                children: Self::apply_sequence(templates, env, stx, expand_scope)?.into_iter()
-                    .chain(std::iter::once(tail.apply(env, stx, expand_scope)?))
+                children: Self::apply_sequence(templates, env, expand_scope)?.into_iter()
+                    .chain(std::iter::once(tail.apply(env, expand_scope)?))
                     .collect(),
                 scopes: Default::default(),
-                location: stx.location,
+                location: Default::default(),
             }),
             Vector(templates) => Ok(Object {
                 e: ObjectT::Vector,
-                children: Self::apply_sequence(templates, env, stx, expand_scope)?,
+                children: Self::apply_sequence(templates, env, expand_scope)?,
                 scopes: Default::default(),
-                location: stx.location,
+                location: Default::default(),
             }),
         }
     }
-    fn apply_sequence(templates: &[Template], env: &MatchSlice, stx: &Object, expand_scope: Scope) -> Result<Vec<Object>, String> {
+    fn apply_sequence(templates: &[Template], env: &MatchSlice, expand_scope: Scope) -> Result<Vec<Object>, ()> {
         templates.iter().try_fold(Vec::with_capacity(templates.len()), |mut outputs, template| {
             if let Template::Ellipsis(template) = template {
                 (0..template.count_ellipsis_reps(env)?).map(|i| env.slice(i))
-                    .map(|env_slice| template.apply(&env_slice, stx, expand_scope))
+                    .map(|env_slice| template.apply(&env_slice, expand_scope))
                     .try_for_each(|app| app.map(|stx| outputs.push(stx)))?;
             } else {
-                outputs.push(template.apply(env, stx, expand_scope)?);
+                outputs.push(template.apply(env, expand_scope)?);
             }
             Ok(outputs)
         })
@@ -635,8 +640,40 @@ impl std::fmt::Display for Template {
 }
 
 impl Rules {
-    fn from<P: IntoIterator<Item = Pattern>, T: IntoIterator<Item = Template>>(patterns: P, templates: T) -> Self {
-        Self(std::iter::zip(patterns, templates).collect())
+    fn new(pattern_stx: &Object, template_stx: &Object, literals: &HashSet<&str>) -> Result<(Pattern, Template), String> {
+        let pattern = Pattern::new(pattern_stx, literals)?;
+        let template = Template::from(template_stx)?;
+        let mut variables = HashMap::new();
+        let mut queue = std::iter::once((&pattern, 0)).collect::<std::collections::VecDeque<_>>();
+        while let Some((pattern, ellipsis_depth)) = queue.pop_front() {
+            match pattern {
+                Pattern::Variable(name) => {
+                    variables.insert(name.as_ref(), ellipsis_depth);
+                },
+                Pattern::Ellipsis(pattern) => queue.push_back((pattern, ellipsis_depth + 1)),
+                Pattern::List(patterns) | Pattern::Vector(patterns) => queue.extend(patterns.iter().map(|p| (p, ellipsis_depth))),
+                Pattern::ImproperList(patterns, tail) => queue.extend(patterns.iter().chain(std::iter::once(tail.as_ref())).map(|p| (p, ellipsis_depth))),
+                _ => (),
+            }
+        }
+
+        let mut queue = std::iter::once((&template, 0)).collect::<std::collections::VecDeque<_>>();
+        while let Some((template, ellipsis_depth)) = queue.pop_front() {
+            match template {
+                Template::Identifier(name) => if let Some(&pattern_depth) = variables.get(name.as_ref()) {
+                    if pattern_depth > ellipsis_depth {
+                        return Err(format!("syntax-rules: missing ellipsis with pattern variable {} in template: {}", name.as_ref(), template_stx));
+                    } else if pattern_depth < ellipsis_depth {
+                        return Err(format!("syntax-rules: too many ellipses for pattern variable {} in template: {}", name.as_ref(), template_stx));
+                    }
+                },
+                Template::Ellipsis(template) => queue.push_back((template, ellipsis_depth + 1)),
+                Template::List(templates) | Template::Vector(templates) => queue.extend(templates.iter().map(|p| (p, ellipsis_depth))),
+                Template::ImproperList(templates, tail) => queue.extend(templates.iter().chain(std::iter::once(tail.as_ref())).map(|p| (p, ellipsis_depth))),
+                _ => (),
+            }
+        }
+        Ok((pattern, template))
     }
 }
 impl std::fmt::Display for Rules {
@@ -795,29 +832,23 @@ impl<'p> Environment<'p> {
             }).collect::<Result<HashSet<_>, _>>()?;
 
             let Some(MatchValue::Many(patterns)) = matches.get("pattern") else { panic!() };
-            let patterns = patterns.iter().map(|pattern| {
-                let MatchValue::One(pattern_stx) = pattern else { panic!() };
-                Pattern::new(pattern_stx, &literals)
-            }).collect::<Result<Vec<_>, _>>()?;
             let Some(MatchValue::Many(templates)) = matches.get("template") else { panic!() };
-            let templates = templates.iter().map(|template| {
+            assert_eq!(patterns.len(), templates.len());
+
+            let macro_index = self.macros.len();
+            let rules = std::iter::zip(patterns, templates).map(|(pattern, template)| {
+                let MatchValue::One(pattern_stx) = pattern else { panic!() };
                 let MatchValue::One(template_stx) = template else { panic!() };
-                Template::from(template_stx)
-            }).collect::<Result<Vec<_>, _>>()?;
-
-            if patterns.len() == templates.len() {
-                let macro_index = self.macros.len();
-                if let Some(bindings) = self.bindings.get_mut(name.as_ref()) {
-                    bindings
-                } else {
-                    self.bindings.entry(name.clone()).or_default()
-                }.insert(stx.scopes.clone(), Binding::SyntaxTransformer(macro_index));
-                self.macros.push(Rules::from(patterns, templates));
-
-                Ok(Object::new(ObjectT::Boolean(true)))
+                Rules::new(pattern_stx, template_stx, &literals)
+            }).collect::<Result<Vec<_>, _>>().map(Rules)?;
+            if let Some(bindings) = self.bindings.get_mut(name.as_ref()) {
+                bindings
             } else {
-                panic!()
-            }
+                self.bindings.entry(name.clone()).or_default()
+            }.insert(stx.scopes.clone(), Binding::SyntaxTransformer(macro_index));
+            self.macros.push(rules);
+
+            Ok(Object::new(ObjectT::Boolean(true)))
         } else if let Some(matches) = VALUE_DEFINITION_PATTERN.try_match(&stx) {
             let Some(MatchValue::One(formals)) = matches.get("formals") else { panic!() };
             for f in &formals.children {
@@ -841,75 +872,61 @@ impl<'p> Environment<'p> {
             stx.children.get_mut(2).unwrap().children = values;
             Ok(stx)
         } else if let Some(matches) = SYNTAX_BINDING_PATTERN.try_match(&stx) {
+            let mut body_scopes = stx.scopes.clone();
             let bind_scope = self.new_scope();
-            let body_scopes = stx.scopes.iter().copied().chain(std::iter::once(bind_scope)).collect::<ScopeSet>();
+            body_scopes.insert(bind_scope);
+
             let Some(MatchValue::Many(names)) = matches.get("name") else { panic!() };
-            let names = names.iter().map(|name| {
-                let MatchValue::One(name_stx) = name else { panic!() };
-                if let ObjectT::Symbol(name) = &(**name_stx).e {
-                    Ok(name)
-                } else {
-                    Err(format!("let-syntax: not an identifier: {}", name_stx))
-                }
-            }).collect::<Result<Vec<_>, _>>()?;
+            let Some(MatchValue::Many(literalses)) = matches.get("literals") else { panic!() };
+            let Some(MatchValue::Many(patternses)) = matches.get("pattern") else { panic!() };
+            let Some(MatchValue::Many(templateses)) = matches.get("template") else { panic!() };
+            assert_eq!(names.len(), patternses.len());
+            assert_eq!(patternses.len(), templateses.len());
+            assert_eq!(literalses.len(), patternses.len());
 
             let macro_start = self.macros.len();
-            for (i, name) in names.iter().enumerate() {
-                if let Some(bindings) = self.bindings.get_mut(name.as_ref()) {
-                    bindings
-                } else {
-                    self.bindings.entry(Cow::clone(name)).or_default()
-                }.insert(body_scopes.clone(), Binding::SyntaxTransformer(macro_start + i));
-            }
-
-            let Some(MatchValue::Many(literals)) = matches.get("literals") else { panic!() };
-            let literals = literals.iter().map(|literal| {
-                let MatchValue::One(literals_stx) = literal else { panic!() };
-                literals_stx.children.iter().map(|literal_stx| {
+            let ruleses = std::iter::zip(std::iter::zip(literalses, patternses), templateses).map(|((literals, patterns), templates)| {
+                let MatchValue::One(literals_stx) = literals else { panic!() };
+                let MatchValue::Many(patterns) = patterns else { panic!() };
+                let MatchValue::Many(templates) = templates else { panic!() };
+                let literals = literals_stx.children.iter().map(|literal_stx| {
                     if let ObjectT::Symbol(ref literal) = literal_stx.e {
                         Ok(literal.as_ref())
                     } else {
                         Err(format!("let-syntax: not an identifier: {}", literal_stx))
                     }
-                }).collect::<Result<HashSet<_>, _>>()
-            }).collect::<Result<Vec<_>, _>>()?;
-
-            let Some(MatchValue::Many(patternses)) = matches.get("pattern") else { panic!() };
-            let patternses = patternses.iter().enumerate().map(|(i, patterns)| {
-                let MatchValue::Many(patterns) = patterns else { panic!() };
-                patterns.iter().map(|pattern| {
+                }).collect::<Result<HashSet<_>, _>>()?;
+                std::iter::zip(patterns, templates).map(|(pattern, template)| {
                     let MatchValue::One(pattern_stx) = pattern else { panic!() };
-                    Pattern::new(pattern_stx, &literals[i])
-                }).collect::<Result<Vec<_>, _>>()
-            }).collect::<Result<Vec<_>, _>>()?;
-
-            let Some(MatchValue::Many(templateses)) = matches.get("template") else { panic!() };
-            let templateses = templateses.iter().map(|templates| {
-                let MatchValue::Many(templates) = templates else { panic!() };
-                templates.iter().map(|template| {
                     let MatchValue::One(template_stx) = template else { panic!() };
-                    Template::from(template_stx)
-                }).collect::<Result<Vec<_>, _>>()
+                    Rules::new(pattern_stx, template_stx, &literals)
+                }).collect::<Result<Vec<_>, _>>().map(Rules)
             }).collect::<Result<Vec<_>, _>>()?;
-
-            if names.len() == patternses.len() && patternses.len() == templateses.len() {
-                self.macros.extend(std::iter::zip(patternses, templateses)
-                    .map(|(patterns, templates)| Rules::from(patterns, templates)));
-
-                let Some(MatchValue::Many(bodys)) = matches.get("body") else { panic!() };
-                let bodys = bodys.iter().map(|body| {
-                    let MatchValue::One(body) = body else { panic!() };
-                    let mut body = (**body).clone();
-                    body.add_scope(bind_scope);
-                    body
-                });
-                Ok(Object::new(ObjectT::List)
-                    .with_children(std::iter::once(Object::new(ObjectT::Symbol(Cow::Borrowed("begin"))))
-                        .chain(bodys).collect())
-                    .with_scopes(body_scopes))
-            } else {
-                panic!()
+            for (i, name) in names.into_iter().enumerate() {
+                let MatchValue::One(name_stx) = name else { panic!() };
+                let name = match (**name_stx).e {
+                    ObjectT::Symbol(ref name) => name,
+                    _ => return Err(format!("let-syntax: not an identifier: {}", name_stx)),
+                };
+                if let Some(bindings) = self.bindings.get_mut(name.as_ref()) {
+                    bindings
+                } else {
+                    self.bindings.entry(name.clone()).or_default()
+                }.insert(body_scopes.clone(), Binding::SyntaxTransformer(macro_start + i));
             }
+            self.macros.extend(ruleses);
+
+            let Some(MatchValue::Many(bodys)) = matches.get("body") else { panic!() };
+            let bodys = bodys.iter().map(|body| {
+                let MatchValue::One(body) = body else { panic!() };
+                let mut body = (**body).clone();
+                body.add_scope(bind_scope);
+                body
+            });
+            Ok(Object::new(ObjectT::List)
+                .with_children(std::iter::once(Object::new(ObjectT::Symbol(Cow::Borrowed("begin"))))
+                    .chain(bodys).collect())
+                .with_scopes(&body_scopes))
         } else {
             stx.children = stx.children.into_iter()
                 .map(|stx| self.parse_definitions(stx))
@@ -931,9 +948,10 @@ impl<'p> Environment<'p> {
                 };
                 if let Some(Binding::SyntaxTransformer(index)) = head {
                     *stx = self.macros.get(index).unwrap().iter()
-                        .find_map(|(pattern, template)| pattern.try_match(stx).map(|e| (e, template)))
-                        .map(|(env, template)| template.apply(&MatchSlice::from(&env), stx, self.new_scope()))
-                        .unwrap_or(Err(format!("syntax-rules: {}: no matching pattern for: {}", stx.children.first().unwrap(), stx)))?;
+                        .filter_map(|(pattern, template)| pattern.try_match(stx).map(|env|
+                            template.apply(&MatchSlice::from(&env), self.new_scope()).ok()).flatten())
+                        .next().ok_or(format!("syntax-rules: {}: no matching pattern for: {}", stx.children.first().unwrap(), stx))?
+                        .with_scopes(&stx.scopes).with_source(stx.location);
                     return Ok(true);
                 } else if Some(Binding::CoreForm(CoreForm::Quote)) == head {
                     return Ok(false);

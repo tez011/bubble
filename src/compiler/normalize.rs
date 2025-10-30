@@ -442,6 +442,7 @@ mod cps {
                             },
                             _ => ControlFlow::Continue(()),
                         }).continue_value().unwrap();
+                        *self = std::mem::take(body);
                         true
                     } else {
                         false
