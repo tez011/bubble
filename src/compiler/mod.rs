@@ -1,5 +1,6 @@
 mod frontend;
 mod normalize;
+mod primitives;
 mod syntax;
 
 pub use frontend::{Environment as FrontendEnvironment};
@@ -45,7 +46,7 @@ impl std::fmt::Display for Arity {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Binding {
     CoreForm(frontend::CoreForm),
-    CorePrimitive(&'static str),
+    CorePrimitive(frontend::CorePrimitive),
     SyntaxTransformer(usize),
     Variable(usize),
 }
@@ -186,7 +187,7 @@ impl std::fmt::Display for LiteralD {
 pub enum Atom {
     Literal(LiteralC),
     Variable(ValueID),
-    Core(&'static str),
+    Core(frontend::CorePrimitive),
 }
 impl std::fmt::Display for Atom {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -195,7 +196,7 @@ impl std::fmt::Display for Atom {
             Literal(LiteralC::Nil) => write!(f, "'()"),
             Literal(x) => std::fmt::Display::fmt(&x, f),
             Variable(x) => std::fmt::Display::fmt(&x, f),
-            Core(x) => std::fmt::Display::fmt(&x, f),
+            Core(x) => std::fmt::Display::fmt(Into::<&'static str>::into(x), f),
         }
     }
 }

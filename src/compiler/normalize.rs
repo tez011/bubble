@@ -264,10 +264,9 @@ mod cps {
                         } else if let Apply { operator, k: Continuation::Ref(k), .. } = e {
                             if k == escape {
                                 if let Atom::Core(operator) = operator {
-                                    let out_arity = env.arities.get(&Binding::CorePrimitive(operator)).unwrap().1;
                                     return match explicits {
-                                        None => ControlFlow::Continue((Some(out_arity), applies)),
-                                        Some(explicits) => ControlFlow::Continue((Some(explicits.join(out_arity)), applies)),
+                                        None => ControlFlow::Continue((Some(operator.returns()), applies)),
+                                        Some(explicits) => ControlFlow::Continue((Some(explicits.join(operator.returns())), applies)),
                                     };
                                 } else if let Atom::Variable(x) = operator {
                                     if x != id { // if it's recursive, it can only return an arity we've already seen; ignore it.
@@ -303,7 +302,7 @@ mod cps {
                 Continuation::Ref(_) => Some(Arity::AtLeast(0)),
                 Continuation::Def(ContinuationDef { formals, .. }) => Some(Arity::from(formals)),
             };
-            let get_arity = |x: &ValueID| io_lambdas.get(x).or_else(|| env.arities.get(&Binding::Variable(x.0))).copied();
+            let get_arity = |x: &ValueID| io_lambdas.get(x).or_else(|| env.arities.get(x)).copied();
             match self.visit_mut(None, |_, e| {
                 if let Apply { operator, operands, kontract, k, location } = e {
                     match operator {
@@ -324,13 +323,13 @@ mod cps {
                                 *kontract = actual;
                             }
                         }
-                        Atom::Core(s) => {
-                            let primitive_arity = env.arities.get(&Binding::CorePrimitive(s)).unwrap();
-                            let (expected, actual) = (primitive_arity.0, Arity::from(&*operands));
+                        Atom::Core(primitive) => {
+                            let expected = primitive.variants().iter().copied().reduce(Arity::join).unwrap_or(Arity::Exact(0));
+                            let actual = Arity::from(&*operands);
                             if !expected.compatible_with(actual) {
                                 return ControlFlow::Break(Some(format!("application: {}: arity mismatch; expected: {}, given: {}", atom_name(operator), expected, actual)));
                             }
-                            let actual = primitive_arity.1;
+                            let actual = primitive.returns();
                             if actual != Arity::Unknown { // all core primitives with unknown return-arity are optimized out of the CPS expression
                                 if let Some(expected) = k_arity(k) {
                                     if !expected.compatible_with(actual) {
@@ -450,7 +449,7 @@ mod cps {
                 }
                 Apply { operator, operands: (operands, operands_tail), kontract, k, location } => {
                     match operator {
-                        Atom::Core("apply") => {
+                        Atom::Core(frontend::CorePrimitive::Apply) => {
                             *self = Apply {
                                 operator: *operands.first().unwrap(),
                                 operands: (operands.split_off(1), *operands_tail),
@@ -460,12 +459,12 @@ mod cps {
                             };
                             true
                         },
-                        Atom::Core("call/cc") => {
+                        Atom::Core(frontend::CorePrimitive::CallWithCurrentContinuation) => {
                             let stored_dynamic_extent = env.new_id();
                             let reified_cont = env.new_id();
                             let values = env.new_id();
                             *self = env.atomize_continuation(std::mem::take(k), |k| Apply {
-                                operator: Atom::Core("__store_dynamic_extent"),
+                                operator: Atom::Core(frontend::CorePrimitive::StoreDynamicExtent),
                                 operands: (vec![], None),
                                 location: Default::default(),
                                 kontract: Arity::Exact(1),
@@ -477,7 +476,7 @@ mod cps {
                                             formals: (vec![], Some(values)),
                                             escape: ContinuationRef::Escape,
                                             body: Box::new(Apply {
-                                                operator: Atom::Core("__rewind_dynamic_extent"),
+                                                operator: Atom::Core(frontend::CorePrimitive::RewindDynamicExtent),
                                                 operands: (vec![Atom::Variable(stored_dynamic_extent)], None),
                                                 location: Default::default(),
                                                 kontract: Arity::Exact(0),
@@ -499,7 +498,7 @@ mod cps {
                             });
                             true
                         },
-                        Atom::Core("call-with-values") => {
+                        Atom::Core(frontend::CorePrimitive::CallWithValues) => {
                             let values = env.new_id();
                             *self = Apply {
                                 operator: *operands.get(0).unwrap(),
@@ -519,7 +518,7 @@ mod cps {
                             };
                             true
                         },
-                        Atom::Core("dynamic-wind") => {
+                        Atom::Core(frontend::CorePrimitive::DynamicWind) => {
                             let stored_dynamic_extent = env.new_id();
                             let thunk_values = env.new_id();
                             *self = Apply {
@@ -530,7 +529,7 @@ mod cps {
                                 k: Continuation::Def(ContinuationDef {
                                     formals: (vec![], None),
                                     body: Box::new(Apply {
-                                        operator: Atom::Core("__push_dynamic_frame"),
+                                        operator: Atom::Core(frontend::CorePrimitive::PushDynamicFrame),
                                         operands: (vec![*operands.get(0).unwrap(), *operands.get(2).unwrap()], None),
                                         location: *location,
                                         kontract: Arity::Exact(1),
@@ -544,7 +543,7 @@ mod cps {
                                                 k: Continuation::Def(ContinuationDef {
                                                     formals: (vec![], Some(thunk_values)),
                                                     body: Box::new(Apply {
-                                                        operator: Atom::Core("__rewind_dynamic_extent"),
+                                                        operator: Atom::Core(frontend::CorePrimitive::RewindDynamicExtent),
                                                         operands: (vec![Atom::Variable(stored_dynamic_extent)], None),
                                                         location: *location,
                                                         kontract: Arity::Exact(0),
@@ -564,25 +563,25 @@ mod cps {
                             };
                             true
                         },
-                        Atom::Core("values") => {
+                        Atom::Core(frontend::CorePrimitive::Values) => {
                             *self = Continue {
                                 k: std::mem::take(k),
                                 values: (std::mem::take(operands), *operands_tail),
                             };
                             true
                         },
-                        Atom::Core("raise") => {
+                        Atom::Core(frontend::CorePrimitive::Raise) => {
                             let eh = env.new_id();
                             let old_extent = env.new_id();
                             *self = Apply {
-                                operator: Atom::Core("__find_exception_handler"),
+                                operator: Atom::Core(frontend::CorePrimitive::FindExceptionHandler),
                                 operands: (vec![], None),
                                 location: Default::default(),
                                 kontract: Arity::Exact(2),
                                 k: Continuation::Def(ContinuationDef {
                                     formals: (vec![eh, old_extent], None),
                                     body: Box::new(Apply {
-                                        operator: Atom::Core("__rewind_dynamic_extent"),
+                                        operator: Atom::Core(frontend::CorePrimitive::RewindDynamicExtent),
                                         operands: (vec![Atom::Variable(old_extent)], None),
                                         location: Default::default(),
                                         kontract: Arity::Exact(0),
@@ -601,10 +600,10 @@ mod cps {
                             };
                             true
                         },
-                        Atom::Core("raise-continuable") => {
+                        Atom::Core(frontend::CorePrimitive::RaiseContinuable) => {
                             let eh = env.new_id();
                             *self = Apply {
-                                operator: Atom::Core("__find_exception_handler"),
+                                operator: Atom::Core(frontend::CorePrimitive::FindExceptionHandler),
                                 operands: (vec![], None),
                                 location: Default::default(),
                                 kontract: Arity::Exact(2),
@@ -621,11 +620,11 @@ mod cps {
                             };
                             true
                         },
-                        Atom::Core("with-exception-handler") => {
+                        Atom::Core(frontend::CorePrimitive::WithExceptionHandler) => {
                             let dynamic_extent = env.new_id();
                             let thunk_values = env.new_id();
                             *self = Apply {
-                                operator: Atom::Core("__push_exception_handler"),
+                                operator: Atom::Core(frontend::CorePrimitive::PushExceptionFrame),
                                 operands: (vec![*operands.get(0).unwrap()], None),
                                 location: Default::default(),
                                 kontract: Arity::Exact(1),
@@ -639,7 +638,7 @@ mod cps {
                                         k: Continuation::Def(ContinuationDef {
                                             formals: (vec![], Some(thunk_values)),
                                             body: Box::new(Apply {
-                                                operator: Atom::Core("__rewind_dynamic_extent"),
+                                                operator: Atom::Core(frontend::CorePrimitive::RewindDynamicExtent),
                                                 operands: (vec![Atom::Variable(dynamic_extent)], None),
                                                 location: Default::default(),
                                                 kontract: Arity::Exact(0),
@@ -961,7 +960,7 @@ pub mod anf {
                         Some(arity) => Some(arity.join(Arity::from(values))),
                     })
                 } else if let TailCall { to, .. } = e {
-                    if let Some(tailcall_arity) = env.arities.get(&Binding::Variable(to.0)).map(|a| a.1) {
+                    if let Some(tailcall_arity) = env.arities.get(to).map(|a| a.1) {
                         ControlFlow::Continue(match arity {
                             None => Some(tailcall_arity),
                             Some(arity) => Some(arity.join(tailcall_arity)),
@@ -1034,11 +1033,11 @@ pub mod anf {
                                 true
                             },
                             Some(Atom::Core(primitive)) => {
-                                let id = env.new_ids(env.arities.get(&Binding::CorePrimitive(primitive)).unwrap().1);
+                                let id = env.new_ids(primitive.returns());
                                 let body = Return { values: (id.0.iter().copied().map(Atom::Variable).collect(), id.1) };
                                 *e = LetValues {
                                     id,
-                                    val: Rhses::Apply { operator: Atom::Core(primitive), operands: std::mem::take(values) },
+                                    val: Rhses::Apply { operator: Atom::Core(*primitive), operands: std::mem::take(values) },
                                     body: Box::new(body),
                                 };
                                 true
@@ -1121,8 +1120,8 @@ pub mod anf {
                                 Atom::Literal(x) => Ok(LiteralRef::Copy(*x)),
                                 Atom::Variable(x) => env.literals.get(x).map(|e| LiteralRef::NoCopy(e.as_ref())).ok_or(()),
                                 Atom::Core(_) => Err(())
-                            }).collect::<Result<Vec<_>, _>>().ok().map(|operands| Self::constant_fold(operator, operands)) {
-                                assert_eq!(env.arities.get(&Binding::CorePrimitive(operator)).unwrap().1, Arity::Exact(returns.len()));
+                            }).collect::<Result<Vec<_>, _>>().ok().map(|operands| Self::constant_fold(*operator, operands)) {
+                                assert_eq!(operator.returns(), Arity::Exact(returns.len()));
                                 let tail_cs = returns.iter().rev()
                                     .take_while(|x| matches!(x, Literal::Copy(_)))
                                     .count(); // The number of LiteralC's at the tail of returns
@@ -1182,11 +1181,11 @@ pub mod anf {
                 _ => false,
             }
         }
-        fn constant_fold(operator: &'static str, operands: Vec<LiteralRef>) -> Option<Vec<Literal>> {
+        fn constant_fold(operator: frontend::CorePrimitive, operands: Vec<LiteralRef>) -> Option<Vec<Literal>> {
             use LiteralRef::*;
             use LiteralC::*;
             match operator {
-                "+" => {
+                frontend::CorePrimitive::Sum => {
                     if operands.iter().all(|op| matches!(op, Copy(Integer(_)))) {
                         let operands = operands.iter().map(|op| {
                             let Copy(Integer(op)) = op else { panic!() };
@@ -1319,7 +1318,7 @@ impl<'p> Environment<'p> {
         let (atoms, new_ids) = ee.iter().map(|e| match &**e {
             stx::Literal(super::Literal::Copy(x)) => (Atom::Literal(*x), None),
             stx::Variable(i) => (Atom::Variable(ValueID(*i)), None),
-            stx::Core(s) => (Atom::Core(s), None),
+            stx::Core(s) => (Atom::Core(*s), None),
             _ => {
                 let x = self.new_id();
                 (Atom::Variable(x), Some(x))
@@ -1529,8 +1528,7 @@ pub fn normalize(e: Located<syntax::Expression>, env: &mut frontend::Environment
     }).is_break() { }
 
     let arity_extension = e.check_arity(&env)?;
-    env.arities.extend(arity_extension.iter()
-        .map(|(k, v)| (Binding::Variable(k.0), *v)));
+    env.arities.extend(arity_extension);
     env.literals.extend(e.visit(HashMap::new(), |mut literals, e| {
         if let cps::Expression::LetLiteral { id, val, .. } = e {
             literals.insert(*id, Rc::clone(val));

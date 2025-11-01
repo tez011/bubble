@@ -13,7 +13,7 @@ type ScopeSet = BTreeSet<Scope>;
 pub enum Expression {
     Literal(Literal),
     Variable(usize),
-    Core(&'static str),
+    Core(frontend::CorePrimitive),
     Call { operator: Box<Located<Expression>>, operands: Vec<Located<Expression>> },
     Lambda { formals: (Vec<Located<usize>>, Option<Located<usize>>), body: Vec<Located<Expression>> },
     Conditional { test: Box<Located<Expression>>, consequent: Box<Located<Expression>>, alternate: Option<Box<Located<Expression>>> },
@@ -53,7 +53,7 @@ impl std::fmt::Display for Expression {
                 _ => write!(f, "{}", literal),
             },
             Variable(i) => write!(f, "x{}", i),
-            Core(s) => s.fmt(f),
+            Core(x) => Into::<&'static str>::into(x).fmt(f),
             Call { operator, operands } => {
                 write!(f, "({}", &***operator)?;
                 for operand in operands {
@@ -715,9 +715,7 @@ struct Environment<'p> {
 impl<'p> From<&'p mut frontend::Environment> for Environment<'p> {
     fn from(parent_env: &'p mut frontend::Environment) -> Self {
         let bindings = parent_env.toplevels.iter()
-            .map(|(name, binding)| (name.clone(), *binding))
-            .chain(CoreForm::all().iter().copied().map(|cf| (Cow::Borrowed(cf.as_str()), Binding::CoreForm(cf))))
-            .map(|(name, binding)| (name, std::iter::once((ScopeSet::default(), binding)).collect()))
+            .map(|(name, binding)| (name.clone(), std::iter::once((ScopeSet::default(), *binding)).collect()))
             .collect();
         Self {
             parent_env,
@@ -1103,20 +1101,20 @@ impl<'p> Environment<'p> {
                     Some(Binding::CoreForm(CoreForm::Quasiquote)) => stx.children.get(1).ok_or_else(|| format!("bad syntax: {}", stx))
                         .map(|stx| self.resolve_qq(stx, depth + 1))?
                         .map(|e| Expression::Call {
-                            operator: Box::new(Expression::Core("list").introduced()),
+                            operator: Box::new(Expression::Core(frontend::CorePrimitive::List).introduced()),
                             operands: vec![Expression::Literal(LiteralD::Static("quasiquote").into()).introduced(), e],
                         }.at(stx.location)),
                     Some(Binding::CoreForm(CoreForm::Unquote | CoreForm::UnquoteSplicing)) if depth == 1 => self.resolve_syntax(stx.children.get(1).ok_or_else(|| format!("bad syntax: {}", stx))?),
                     Some(Binding::CoreForm(CoreForm::Unquote)) => stx.children.get(1).ok_or_else(|| format!("bad syntax: {}", stx))
                         .map(|stx| self.resolve_qq(stx, depth - 1))?
                         .map(|e| Expression::Call {
-                            operator: Box::new(Expression::Core("list").introduced()),
+                            operator: Box::new(Expression::Core(frontend::CorePrimitive::List).introduced()),
                             operands: vec![Expression::Literal(LiteralD::Static("unquote").into()).introduced(), e],
                         }.at(stx.location)),
                     Some(Binding::CoreForm(CoreForm::UnquoteSplicing)) => stx.children.get(1).ok_or_else(|| format!("bad syntax: {}", stx))
                         .map(|stx| self.resolve_qq(stx, depth - 1))?
                         .map(|e| Expression::Call {
-                            operator: Box::new(Expression::Core("list").introduced()),
+                            operator: Box::new(Expression::Core(frontend::CorePrimitive::List).introduced()),
                             operands: vec![Expression::Literal(LiteralD::Static("unquote-splicing").into()).introduced(), e],
                         }.at(stx.location)),
                     _ => self.resolve_qq_list(stx, depth),
@@ -1131,22 +1129,22 @@ impl<'p> Environment<'p> {
                     Ok(Expression::Literal(Literal::NoCopy(LiteralD::List(ee, tail))).at(location))
                 },
                 Located { item: Expression::Call { operator, mut operands }, location } => match (&**operator, operands.pop()) {
-                    (Expression::Core("list"), Some(tail)) => Ok(Expression::Call {
-                        operator: Box::new(Expression::Core("append").introduced()),
+                    (Expression::Core(frontend::CorePrimitive::List), Some(tail)) => Ok(Expression::Call {
+                        operator: Box::new(Expression::Core(frontend::CorePrimitive::Append).introduced()),
                         operands: vec![Expression::Call {
-                            operator: Box::new(Expression::Core("list").introduced()),
+                            operator: Box::new(Expression::Core(frontend::CorePrimitive::List).introduced()),
                             operands,
                         }.at(location), tail],
                     }.at(location)),
-                    (Expression::Core("list"), None) => Ok(Expression::Call { operator, operands }.at(location)),
-                    (Expression::Core("append"), Some(Located { item: Expression::Call { operator: tail_operator, operands: mut tail_operands }, location: tail_location })) if matches!(**tail_operator, Expression::Core("list")) => {
+                    (Expression::Core(frontend::CorePrimitive::List), None) => Ok(Expression::Call { operator, operands }.at(location)),
+                    (Expression::Core(frontend::CorePrimitive::Append), Some(Located { item: Expression::Call { operator: tail_operator, operands: mut tail_operands }, location: tail_location })) if matches!(**tail_operator, Expression::Core(frontend::CorePrimitive::List)) => {
                         if let Some(tail) = tail_operands.pop() {
                             operands.push(Expression::Call { operator: tail_operator, operands: tail_operands }.at(tail_location));
                             operands.push(tail);
                         }
                         Ok(Expression::Call { operator, operands }.at(location))
                     },
-                    (Expression::Core("append"), None) => Ok(Expression::Literal(Literal::Copy(LiteralC::Nil)).at(location)),
+                    (Expression::Core(frontend::CorePrimitive::Append), None) => Ok(Expression::Literal(Literal::Copy(LiteralC::Nil)).at(location)),
                     _ => panic!(),
                 },
                 _ => panic!(),
@@ -1154,20 +1152,20 @@ impl<'p> Environment<'p> {
             Quasiquote => stx.children.first().ok_or_else(|| format!("bad syntax: {}", stx))
                 .map(|stx| self.resolve_qq(stx, depth + 1))?
                 .map(|e| Expression::Call {
-                    operator: Box::new(Expression::Core("list").introduced()),
+                    operator: Box::new(Expression::Core(frontend::CorePrimitive::List).introduced()),
                     operands: vec![Expression::Literal(LiteralD::Static("quasiquote").into()).introduced(), e],
                 }.at(stx.location)),
             Unquote | UnquoteSplicing if depth == 1 => self.resolve_syntax(stx.children.first().ok_or_else(|| format!("bad syntax: {}", stx))?),
             Unquote => stx.children.first().ok_or_else(|| format!("bad syntax: {}", stx))
                 .map(|stx| self.resolve_qq(stx, depth - 1))?
                 .map(|e| Expression::Call {
-                    operator: Box::new(Expression::Core("list").introduced()),
+                    operator: Box::new(Expression::Core(frontend::CorePrimitive::List).introduced()),
                     operands: vec![Expression::Literal(LiteralD::Static("unquote").into()).introduced(), e],
                 }.at(stx.location)),
             UnquoteSplicing => stx.children.first().ok_or_else(|| format!("bad syntax: {}", stx))
                 .map(|stx| self.resolve_qq(stx, depth - 1))?
                 .map(|e| Expression::Call {
-                    operator: Box::new(Expression::Core("list").introduced()),
+                    operator: Box::new(Expression::Core(frontend::CorePrimitive::List).introduced()),
                     operands: vec![Expression::Literal(LiteralD::Static("unquote-splicing").into()).introduced(), e],
                 }.at(stx.location)),
         }
@@ -1200,7 +1198,7 @@ impl<'p> Environment<'p> {
                 operands.push(e);
             } else {
                 blocks.push(Expression::Call {
-                    operator: Box::new(Expression::Core("list").introduced()),
+                    operator: Box::new(Expression::Core(frontend::CorePrimitive::List).introduced()),
                     operands: vec![e],
                 }.at(stx.location));
                 appending = true;
@@ -1220,7 +1218,7 @@ impl<'p> Environment<'p> {
                 e => Ok(e),
             },
             2.. => Ok(Expression::Call {
-                operator: Box::new(Expression::Core("append").introduced()),
+                operator: Box::new(Expression::Core(frontend::CorePrimitive::Append).introduced()),
                 operands: blocks,
             }.at(stx.location)),
         }
