@@ -3,7 +3,7 @@ mod normalize;
 mod primitives;
 mod syntax;
 
-pub use frontend::{Environment as FrontendEnvironment};
+pub use frontend::{CorePrimitive, Environment as FrontendEnvironment};
 pub use normalize::anf::{Expression, Lambda};
 pub use normalize::{normalize as normalize_syntax};
 pub use syntax::{expand as expand_syntax, read as read_syntax};
@@ -23,12 +23,12 @@ impl Arity {
             _ => Unknown,
         }
     }
-    pub fn compatible_with(self, other: Self) -> bool {
+    /// Is it permissible to send `actual` values to an expression expecting `expected` values?
+    pub fn compatible(expected: Self, actual: Self) -> bool {
         use Arity::*;
-        match (self, other) {
-            (Exact(m), Exact(n)) => m == n,
-            (AtLeast(m), Exact(n) | AtLeast(n)) => m <= n,
-            (Unknown, _) => true,
+        match (expected, actual) {
+            (Exact(e), Exact(a)) => e == a,
+            (AtLeast(e), AtLeast(a) | Exact(a)) => e <= a,
             _ => false,
         }
     }

@@ -44,7 +44,7 @@ impl From<ContinuationID> for Continuation {
 mod cps {
     use crate::compiler::{LiteralC, LiteralD, Location};
     use super::*;
-    const BETA_EXPANSION_COMPLEXITY_THRESHOLD: usize = 6;
+    const BETA_EXPANSION_COMPLEXITY_THRESHOLD: usize = 10;
 
     #[derive(Debug, Clone)]
     pub(super) struct Lambda {
@@ -229,12 +229,13 @@ mod cps {
             use Expression::*;
             let Assign { vars, values, .. } = self else { panic!() };
             if let Some(index) = values.0.iter().enumerate().find_map(|(i, &v)| if v == Atom::Variable(*id) { Some(i) } else { None }) {
-                values.0.swap_remove(index);
-                *id = vars.0.swap_remove(index);
-                true
-            } else {
-                false
+                if index < vars.0.len() {
+                    values.0.swap_remove(index);
+                    *id = vars.0.swap_remove(index);
+                    return true;
+                }
             }
+            false
         }
 
         pub(super) fn check_arity(&mut self, env: &Environment) -> Result<HashMap<ValueID, (Arity, Arity)>, String> {
@@ -310,13 +311,13 @@ mod cps {
                         Atom::Variable(x) => {
                             let expected = get_arity(x).map(|a| a.0).unwrap_or(Arity::Unknown);
                             let actual = Arity::from(&*operands);
-                            if !expected.compatible_with(actual) {
+                            if !Arity::compatible(expected, actual) {
                                 return ControlFlow::Break(Some(format!("application: {}: arity mismatch; expected: {}, given: {}", atom_name(operator), expected, actual)));
                             }
 
                             if let Some(actual) = get_arity(x).map(|a| a.1) {
                                 if let Some(expected) = k_arity(k) {
-                                    if !expected.compatible_with(actual) {
+                                    if !Arity::compatible(expected, actual) {
                                         return ControlFlow::Break(Some(format!("application: {}: return value mismatch; expected: {}, given: {}", atom_name(operator), expected, actual)));
                                     }
                                 }
@@ -326,13 +327,13 @@ mod cps {
                         Atom::Core(primitive) => {
                             let expected = primitive.variants().iter().copied().reduce(Arity::join).unwrap_or(Arity::Exact(0));
                             let actual = Arity::from(&*operands);
-                            if !expected.compatible_with(actual) {
+                            if !Arity::compatible(expected, actual) {
                                 return ControlFlow::Break(Some(format!("application: {}: arity mismatch; expected: {}, given: {}", atom_name(operator), expected, actual)));
                             }
                             let actual = primitive.returns();
                             if actual != Arity::Unknown { // all core primitives with unknown return-arity are optimized out of the CPS expression
                                 if let Some(expected) = k_arity(k) {
-                                    if !expected.compatible_with(actual) {
+                                    if !Arity::compatible(expected, actual) {
                                         return ControlFlow::Break(Some(format!("application: {}: return value mismatch; expected: {}, given: {}", atom_name(operator), expected, actual)));
                                     }
                                 }
@@ -343,19 +344,19 @@ mod cps {
                 } else if let Continue { k, values } = e {
                     if let Some(expected) = k_arity(k) {
                         let actual = Arity::from(&*values);
-                        if !expected.compatible_with(actual) {
+                        if !Arity::compatible(expected, actual) {
                             return ControlFlow::Break(Some(format!("continuation: arity mismatch; expected: {}, given: {}", expected, actual)));
                         }
                     }
                 } else if let Assign { vars, values, k } = e {
-                    let expected = Arity::from(&*values);
-                    let actual = Arity::from(&*vars);
-                    if !expected.compatible_with(actual) {
+                    let expected = Arity::from(&*vars);
+                    let actual = Arity::from(&*values);
+                    if !Arity::compatible(expected, actual) {
                         return ControlFlow::Break(Some(format!("assignment: arity mismatch; expected: {}, given: {}", expected, actual)));
                     }
                     if let Some(expected) = k_arity(k) {
                         let actual = Arity::Exact(0);
-                        if !expected.compatible_with(actual) {
+                        if !Arity::compatible(expected, actual) {
                             return ControlFlow::Break(Some(format!("continuation: arity mismatch; expected: {}, given: {}", expected, actual)));
                         }
                     }
@@ -449,16 +450,6 @@ mod cps {
                 }
                 Apply { operator, operands: (operands, operands_tail), kontract, k, location } => {
                     match operator {
-                        Atom::Core(frontend::CorePrimitive::Apply) => {
-                            *self = Apply {
-                                operator: *operands.first().unwrap(),
-                                operands: (operands.split_off(1), *operands_tail),
-                                location: *location,
-                                kontract: *kontract,
-                                k: std::mem::take(k),
-                            };
-                            true
-                        },
                         Atom::Core(frontend::CorePrimitive::CallWithCurrentContinuation) => {
                             let stored_dynamic_extent = env.new_id();
                             let reified_cont = env.new_id();
@@ -688,7 +679,6 @@ mod cps {
 pub mod anf {
     use crate::compiler::{Literal, LiteralRef, LiteralC, LiteralD};
     use super::*;
-    const BETA_EXPANSION_COMPLEXITY_THRESHOLD: usize = 11;
 
     fn format_varargs<T: std::fmt::Display, U: Copy + std::fmt::Display>(formals: &Vec<T>, tail: Option<U>) -> String {
         let formals0 = formals.iter()
@@ -709,8 +699,8 @@ pub mod anf {
     pub struct Lambda {
         pub(crate) formals: (Vec<ValueID>, Option<ValueID>),
         pub(crate) closed_env: Vec<ValueID>,
-        pub(crate) body: Box<Expression>,
         pub(crate) returns: Arity,
+        pub(crate) body: Box<Expression>,
     }
     impl std::fmt::Display for Lambda {
         fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -719,6 +709,14 @@ pub mod anf {
                 writeln!(f, "    {}", line)?;
             }
             writeln!(f, "}}")
+        }
+    }
+    impl Lambda {
+        pub(super) fn optimize(&mut self, env: &Environment) {
+            while self.body.visit_mut((), |_, e| match e.optimize(&env, self.returns) {
+                true => ControlFlow::Break(()),
+                false => ControlFlow::Continue(())
+            }).is_break() { }
         }
     }
 
@@ -850,49 +848,6 @@ pub mod anf {
             f(r, self)
         }
 
-        fn complexity(&self) -> usize {
-            self.visit(0, |count, _| ControlFlow::Continue(count + 1))
-                .continue_value().unwrap()
-        }
-
-        fn count_uses(&self, target: ValueID) -> usize {
-            self.visit(0, |count, e| {
-                use Expression::*;
-                ControlFlow::Continue(count + match e {
-                    Let { .. } => 0,
-                    LetValues { val, .. } => match val {
-                        Rhses::Values { values } => values.0.iter()
-                            .filter_map(|a| if let Atom::Variable(a) = a { Some(*a) } else { None })
-                            .chain(values.1.iter().copied())
-                            .filter(|&i| i == target).count(),
-                        Rhses::Apply { operator, operands } => std::iter::once(operator)
-                            .chain(operands.0.iter())
-                            .filter_map(|a| if let Atom::Variable(a) = a { Some(*a) } else { None })
-                            .chain(operands.1.iter().copied())
-                            .filter(|&i| i == target).count(),
-                    },
-                    Branch { test, .. } => match test {
-                        Atom::Variable(test) => if target == *test { 1 } else { 0 },
-                        _ => 0,
-                    },
-                    Return { values } => {
-                        values.0.iter()
-                            .filter_map(|a| if let Atom::Variable(a) = a { Some(*a) } else { None })
-                            .chain(values.1.iter().copied())
-                            .filter(|&i| i == target).count()
-                    },
-                    TailCall { to, values, .. } => {
-                        values.0.iter()
-                            .filter_map(|a| if let Atom::Variable(a) = a { Some(*a) } else { None })
-                            .chain(values.1.iter().copied())
-                            .chain(std::iter::once(*to))
-                            .filter(|&i| i == target).count()
-                    },
-                    Nop | Halt(_) => 0,
-                })
-            }).continue_value().unwrap()
-        }
-
         /// Returns a tuple of (variables introduced, variables used).
         fn variables(&self) -> (HashSet<ValueID>, HashSet<ValueID>) {
             use Expression::*;
@@ -951,6 +906,7 @@ pub mod anf {
                 ControlFlow::Continue((intros, uses))
             }).continue_value().unwrap()
         }
+
         pub(super) fn return_arity(&self, env: &Environment) -> Arity {
             use Expression::*;
             self.visit(None, |arity: Option<Arity>, e| {
@@ -1050,136 +1006,75 @@ pub mod anf {
             }).continue_value().unwrap()
         }
 
-        pub(super) fn optimize(&mut self, env: &Environment) -> bool {
+        fn optimize(&mut self, env: &Environment, returns: Arity) -> bool {
             use Expression::*;
-            match self {
-                Let { id: lambda_id, val: Rhs::Lambda(lambda), body } => {
-                    let uses = body.count_uses(*lambda_id);
-                    let applies = body.visit(0, |count: usize, e: &Expression| {
-                        ControlFlow::Continue(count + match e {
-                            LetValues { val: Rhses::Apply { operator: Atom::Variable(operator), .. }, .. } => if lambda_id == operator { 1 } else { 0 },
-                            TailCall { to, .. } => if lambda_id == to { 1 } else { 0 },
-                            _ => 0,
-                        })
-                    }).continue_value().unwrap();
-                    let is_recursive = match lambda.body.visit(false, |is_recursive, e| match e {
-                        LetValues { val: Rhses::Apply { operator: Atom::Variable(operator), .. }, .. } if lambda_id == operator => ControlFlow::Break(true),
-                        TailCall { to, .. } if lambda_id == to => ControlFlow::Break(true),
-                        _ => ControlFlow::Continue(is_recursive),
-                    }) {
-                        ControlFlow::Continue(x) => x,
-                        ControlFlow::Break(x) => x,
-                    };
-                    if env.is_internal_binding(lambda_id) == false {
-                        false
-                    } else if uses == 0 {
-                        *self = std::mem::take(body);
-                        true
-                    } else if uses == applies && !is_recursive && (applies == 1 || lambda.body.complexity() < BETA_EXPANSION_COMPLEXITY_THRESHOLD) {
-                        body.visit_mut((), |_, e| match e {
-                            LetValues { id, val: Rhses::Apply { operator: Atom::Variable(operator), operands }, body } if lambda_id == operator => {
-                                let mut n = *if applies == 1 { std::mem::take(&mut lambda.body) } else { lambda.body.clone() };
-                                n.rename(&lambda.formals, &operands, env);
-                                n.visit_mut((), |_, e| {
-                                    if let Return { values } = e {
-                                        *e = LetValues { id: id.clone(), val: Rhses::Values { values: values.clone() }, body: body.clone() };
-                                    }
-                                    ControlFlow::Continue(())
-                                }).continue_value().unwrap();
-                                *e = n;
-                                ControlFlow::Continue(())
-                            },
-                            TailCall { to, values } if lambda_id == to => {
-                                let mut n = *if applies == 1 { std::mem::take(&mut lambda.body) } else { lambda.body.clone() };
-                                n.rename(&lambda.formals, &values, env);
-                                *e = n;
-                                ControlFlow::Continue(())
-                            },
-                            _ => ControlFlow::Continue(()),
-                        }).continue_value().unwrap();
-                        *self = std::mem::take(body);
-                        true
-                    } else {
-                        false
-                    }
-                },
-                Let { val: Rhs::Closure { .. }, .. } => unreachable!(),
-                LetValues { id, val: Rhses::Values { values }, body } => {
-                    if id.0.iter().chain(id.1.iter()).all(|id| env.is_internal_binding(id)) {
-                        body.rename(&id, &values, env);
-                        *self = std::mem::take(body);
-                        true
-                    } else {
-                        false
-                    }
-                },
-                LetValues { id: (id, tail_id), val: Rhses::Apply { operator, operands }, body } => {
-                    if let Atom::Core(operator) = operator {
-                        if let (operands, None) = operands {
-                            if let Some(Some(returns)) = operands.iter().map(|atom| match atom {
-                                Atom::Literal(x) => Ok(LiteralRef::Copy(*x)),
-                                Atom::Variable(x) => env.literals.get(x).map(|e| LiteralRef::NoCopy(e.as_ref())).ok_or(()),
-                                Atom::Core(_) => Err(())
-                            }).collect::<Result<Vec<_>, _>>().ok().map(|operands| Self::constant_fold(*operator, operands)) {
-                                assert_eq!(operator.returns(), Arity::Exact(returns.len()));
-                                let tail_cs = returns.iter().rev()
-                                    .take_while(|x| matches!(x, Literal::Copy(_)))
-                                    .count(); // The number of LiteralC's at the tail of returns
-                                let inner_body = if returns.len() > id.len() + tail_cs {
-                                    // This will only be true if tail_id exists and captures some LiteralD.
-                                    // If tail_id is None, the arity checker enforces that returns.len() <= id.len() + tail_cs for all values of tail_cs.
-                                    // Generate temporaries for any captured LiteralD, and then assign the whole set of temporaries to the old tail_id.
-                                    let temps = env.new_ids(Arity::AtLeast(returns.len() - (id.len() + tail_cs)));
-                                    let init = LetValues {
-                                        id: (vec![], *tail_id),
-                                        val: Rhses::Values { values: (temps.0.iter().copied().map(Atom::Variable).collect(), temps.1) },
-                                        body: std::mem::take(body),
-                                    };
-                                    *tail_id = temps.1;
-                                    id.extend(temps.0.into_iter());
-                                    Box::new(init)
-                                } else {
-                                    std::mem::take(body)
+            if let LetValues { id: (id, tail_id), val: Rhses::Apply { operator, operands }, body } = self {
+                if let Atom::Core(operator) = operator {
+                    if let (operands, None) = operands {
+                        if let Some(Some(returns)) = operands.iter().map(|atom| match atom {
+                            Atom::Literal(x) => Ok(LiteralRef::Copy(*x)),
+                            Atom::Variable(x) => env.literals.get(x).map(|e| LiteralRef::NoCopy(e.as_ref())).ok_or(()),
+                            Atom::Core(_) => Err(())
+                        }).collect::<Result<Vec<_>, _>>().ok().map(|operands| Self::constant_fold(*operator, operands)) {
+                            assert_eq!(operator.returns(), Arity::Exact(returns.len()));
+                            let tail_cs = returns.iter().rev()
+                                .take_while(|x| matches!(x, Literal::Copy(_)))
+                                .count(); // The number of LiteralC's at the tail of returns
+                            let inner_body = if returns.len() > id.len() + tail_cs {
+                                // This will only be true if tail_id exists and captures some LiteralD.
+                                // If tail_id is None, the arity checker enforces that returns.len() <= id.len() + tail_cs for all values of tail_cs.
+                                // Generate temporaries for any captured LiteralD, and then assign the whole set of temporaries to the old tail_id.
+                                let temps = env.new_ids(Arity::AtLeast(returns.len() - (id.len() + tail_cs)));
+                                let init = LetValues {
+                                    id: (vec![], *tail_id),
+                                    val: Rhses::Values { values: (temps.0.iter().copied().map(Atom::Variable).collect(), temps.1) },
+                                    body: std::mem::take(body),
                                 };
+                                *tail_id = temps.1;
+                                id.extend(temps.0.into_iter());
+                                Box::new(init)
+                            } else {
+                                std::mem::take(body)
+                            };
 
-                                // Assign all LiteralC in one LetValues, since they're atomic.
-                                let inner = {
-                                    let mut inner_id = Vec::with_capacity(returns.len());
-                                    let mut inner_val = Vec::with_capacity(returns.len());
-                                    for (id, r) in std::iter::zip(id.iter().copied(), returns.iter()) {
-                                        if let Literal::Copy(x) = r {
-                                            inner_id.push(id);
-                                            inner_val.push(Atom::Literal(*x));
-                                        }
+                            // Assign all LiteralC in one LetValues, since they're atomic.
+                            let inner = {
+                                let mut inner_id = Vec::with_capacity(returns.len());
+                                let mut inner_val = Vec::with_capacity(returns.len());
+                                for (id, r) in std::iter::zip(id.iter().copied(), returns.iter()) {
+                                    if let Literal::Copy(x) = r {
+                                        inner_id.push(id);
+                                        inner_val.push(Atom::Literal(*x));
                                     }
-                                    inner_val.extend(returns.iter().skip(id.len()).map(|x| match x {
-                                        Literal::Copy(x) => Atom::Literal(*x),
-                                        Literal::NoCopy(_) => panic!(),
-                                    }));
-                                    LetValues { id: (inner_id, *tail_id), val: Rhses::Values { values: (inner_val, None) }, body: inner_body }
-                                };
+                                }
+                                inner_val.extend(returns.iter().skip(id.len()).map(|x| match x {
+                                    Literal::Copy(x) => Atom::Literal(*x),
+                                    Literal::NoCopy(_) => panic!(),
+                                }));
+                                LetValues { id: (inner_id, *tail_id), val: Rhses::Values { values: (inner_val, None) }, body: inner_body }
+                            };
 
-                                // Hoist all LiteralD into their own separate Let's.
-                                *self = std::iter::zip(id.iter().copied(), returns.into_iter()).rev().fold(inner, |e, (id, r)| match r {
-                                    Literal::Copy(_) => e,
-                                    Literal::NoCopy(r) => Let { id, val: Rhs::Literal(Rc::new(r)), body: Box::new(e) },
-                                });
-                                return true;
-                            }
+                            // Hoist all LiteralD into their own separate Let's.
+                            *self = std::iter::zip(id.iter().copied(), returns.into_iter()).rev().fold(inner, |e, (id, r)| match r {
+                                Literal::Copy(_) => e,
+                                Literal::NoCopy(r) => Let { id, val: Rhs::Literal(Rc::new(r)), body: Box::new(e) },
+                            });
+                            return true;
                         }
                     }
-                    if let Return { values: (values, tail_value) } = &**body {
-                        if let Atom::Variable(to) = *operator {
+                }
+                if let Return { values: (values, tail_value) } = &**body {
+                    if let Atom::Variable(to) = operator {
+                        if env.arities.get(to).map(|a| a.1).is_some_and(|tail_call_out_arity| tail_call_out_arity == returns) {
                             if std::iter::zip(id.iter().copied(), values.iter().copied()).all(|(i, a)| a == Atom::Variable(i)) && tail_id == tail_value {
-                                *self = TailCall { to, values: std::mem::take(operands) };
+                                *self = TailCall { to: *to, values: std::mem::take(operands) };
                                 return true;
                             }
                         }
                     }
-                    false
-                },
-                _ => false,
+                }
             }
+            false
         }
         fn constant_fold(operator: frontend::CorePrimitive, operands: Vec<LiteralRef>) -> Option<Vec<Literal>> {
             use LiteralRef::*;
@@ -1218,8 +1113,8 @@ pub mod anf {
                     lambdas.push(Lambda {
                         formals: std::mem::take(&mut lambda.formals),
                         closed_env,
-                        body: std::mem::take(&mut lambda.body),
                         returns: lambda.returns,
+                        body: std::mem::take(&mut lambda.body),
                     });
                     *e = converted;
                 }
@@ -1231,8 +1126,8 @@ pub mod anf {
             lambdas.push(Lambda {
                 formals: (vec![], None),
                 closed_env: uses.difference(&intros).copied().collect(),
-                body: Box::new(self),
                 returns: root_returns,
+                body: Box::new(self),
             });
             lambdas
         }
@@ -1520,7 +1415,6 @@ impl<'p> Environment<'p> {
 pub fn normalize(e: Located<syntax::Expression>, env: &mut frontend::Environment) -> Result<Vec<anf::Lambda>, String> {
     let mut env = Environment::from(env);
     let mut e = env.to_cps(e, Continuation::Ref(ContinuationRef::Escape));
-    e.check_arity(&env)?;
 
     while e.visit_mut((), |_, e| match e.optimize(&env) {
         true => ControlFlow::Break(()),
@@ -1537,12 +1431,7 @@ pub fn normalize(e: Located<syntax::Expression>, env: &mut frontend::Environment
     }).continue_value().unwrap());
     eprintln!("cps: {:?}", e);
 
-    let mut e = env.normalize_cps(e);
-    while e.visit_mut((), |_, e| match e.optimize(&env) {
-        true => ControlFlow::Break(()),
-        false => ControlFlow::Continue(()),
-    }).is_break() { }
-    eprintln!("anf: {:?}", e);
-
-    Ok(e.to_closures(&env))
+    let mut closures = env.normalize_cps(e).to_closures(&env);
+    closures.iter_mut().for_each(|cl| cl.optimize(&env));
+    Ok(closures)
 }
